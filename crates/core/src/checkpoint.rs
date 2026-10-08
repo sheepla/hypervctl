@@ -2,7 +2,7 @@
 
 use std::time::SystemTime;
 
-use crate::ids::CheckpointId;
+pub use crate::ids::CheckpointId;
 
 /// A checkpoint of one VM.
 #[derive(Debug, Clone, PartialEq, Eq)]

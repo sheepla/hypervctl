@@ -79,7 +79,7 @@ impl fmt::Display for UnavailableReason {
 }
 
 /// An error, classified for the frontend.
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub enum HyperVError {
     #[error("permission denied")]
     PermissionDenied { raw: Option<RawError> },

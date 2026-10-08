@@ -99,9 +99,15 @@ mod tests {
 
     #[test]
     fn round_trips_through_display_and_parse() {
-        let id: VmId = SAMPLE.parse().expect("valid uuid");
+        let id: VmId = match SAMPLE.parse() {
+            Ok(id) => id,
+            Err(error) => panic!("the sample must parse: {error}"),
+        };
         assert_eq!(id.to_string(), SAMPLE);
-        let parsed: VmId = id.to_string().parse().expect("valid uuid");
+        let parsed: VmId = match id.to_string().parse() {
+            Ok(parsed) => parsed,
+            Err(error) => panic!("the rendered id must parse: {error}"),
+        };
         assert_eq!(parsed, id);
     }
 

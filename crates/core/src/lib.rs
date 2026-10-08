@@ -6,17 +6,25 @@
 
 #![forbid(unsafe_code)]
 
+pub mod actor;
 pub mod checkpoint;
 pub mod error;
+pub mod handle;
+pub mod hyper_v;
 pub mod ids;
+pub mod job;
 pub mod switch;
 pub mod target;
 pub mod vhd;
 pub mod vm;
 
+pub use actor::BackendActor;
 pub use checkpoint::{Checkpoint, CheckpointKind};
 pub use error::{HyperVError, RawError, UnavailableReason};
+pub use handle::BackendHandle;
+pub use hyper_v::{HyperV, RequestedState};
 pub use ids::{CheckpointId, SwitchId, VmId};
+pub use job::{JobRef, JobStatus, Pending};
 pub use switch::{SwitchDetail, SwitchKind, SwitchSummary, VlanMode, VlanSettings};
 pub use target::{Candidate, Target, TargetKind};
 pub use vhd::{Controller, ControllerKind, VhdAttachment, VhdFormat, VhdInfo, VhdKind};
