@@ -1,0 +1,15 @@
+[package]
+name = "hypervctl"
+version.workspace = true
+edition.workspace = true
+description = "Hyper-V command line and TUI"
+publish = false
+
+[[bin]]
+name = "hypervctl"
+path = "src/main.rs"
+
+[dependencies]
+hypervctl-core.workspace = true
+hypervctl-backend-wmi.workspace = true
+hypervctl-backend-mock.workspace = true

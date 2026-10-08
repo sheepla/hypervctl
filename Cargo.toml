@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/backend-wmi",
+    "crates/backend-mock",
+    "crates/hypervctl",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+thiserror = "2"
+uuid = "1"
+
+hypervctl-core = { path = "crates/core" }
+hypervctl-backend-wmi = { path = "crates/backend-wmi" }
+hypervctl-backend-mock = { path = "crates/backend-mock" }

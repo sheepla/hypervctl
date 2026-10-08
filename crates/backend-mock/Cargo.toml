@@ -1,0 +1,11 @@
+[package]
+name = "hypervctl-backend-mock"
+version.workspace = true
+edition.workspace = true
+description = "In-memory Hyper-V backend for tests and non-Windows development"
+publish = false
+
+[dependencies]
+thiserror.workspace = true
+uuid.workspace = true
+hypervctl-core.workspace = true

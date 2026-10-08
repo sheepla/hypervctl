@@ -1,0 +1,11 @@
+[package]
+name = "hypervctl-backend-wmi"
+version.workspace = true
+edition.workspace = true
+description = "WMI-backed Hyper-V backend (Windows only)"
+publish = false
+
+[dependencies]
+thiserror.workspace = true
+uuid.workspace = true
+hypervctl-core.workspace = true

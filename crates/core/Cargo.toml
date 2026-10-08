@@ -1,0 +1,10 @@
+[package]
+name = "hypervctl-core"
+version.workspace = true
+edition.workspace = true
+description = "Domain types and backend-agnostic error classification"
+publish = false
+
+[dependencies]
+thiserror.workspace = true
+uuid.workspace = true
