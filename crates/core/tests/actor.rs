@@ -6,10 +6,15 @@ use std::thread;
 use std::time::Duration;
 
 use hypervctl_core::{
-    BackendActor, Checkpoint, CheckpointId, HyperV, HyperVError, JobRef, JobStatus, Pending,
-    RawError, RequestedState, SwitchDetail, SwitchId, SwitchSummary, VhdAttachment, VhdInfo,
-    VmDetail, VmId, VmState, VmSummary,
+    BackendActor, ChangeEvent, Checkpoint, CheckpointId, HyperV, HyperVError, JobRef, JobStatus,
+    Pending, RawError, RequestedState, SwitchDetail, SwitchId, SwitchSummary, VhdAttachment,
+    VhdInfo, VmDetail, VmId, VmState, VmSummary,
 };
+
+fn no_notifications() -> Result<tokio::sync::mpsc::UnboundedReceiver<ChangeEvent>, HyperVError> {
+    let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    Ok(rx)
+}
 
 fn unused() -> HyperVError {
     HyperVError::backend(RawError::new("not exercised by this test"))
@@ -84,6 +89,12 @@ impl HyperV for NotSendBackend {
     fn job_status(&mut self, _job: JobRef) -> Result<JobStatus, HyperVError> {
         Err(unused())
     }
+
+    fn subscribe_changes(
+        &mut self,
+    ) -> Result<tokio::sync::mpsc::UnboundedReceiver<ChangeEvent>, HyperVError> {
+        no_notifications()
+    }
 }
 
 /// A backend that dies the first time it is asked for the VM list.
@@ -154,6 +165,12 @@ impl HyperV for PanickingBackend {
 
     fn job_status(&mut self, _job: JobRef) -> Result<JobStatus, HyperVError> {
         Err(unused())
+    }
+
+    fn subscribe_changes(
+        &mut self,
+    ) -> Result<tokio::sync::mpsc::UnboundedReceiver<ChangeEvent>, HyperVError> {
+        no_notifications()
     }
 }
 

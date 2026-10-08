@@ -2,13 +2,15 @@
 name = "hypervctl-core"
 version.workspace = true
 edition.workspace = true
-description = "Domain types and backend-agnostic error classification"
+description = "Domain types, backend-agnostic error classification, actor and operations"
 publish = false
 
 [dependencies]
 thiserror.workspace = true
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "time"] }
+tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
+hypervctl-backend-mock = { path = "../backend-mock" }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "test-util"] }

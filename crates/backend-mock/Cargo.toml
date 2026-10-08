@@ -7,5 +7,6 @@ publish = false
 
 [dependencies]
 thiserror.workspace = true
+tokio = { workspace = true, features = ["sync"] }
 uuid.workspace = true
 hypervctl-core.workspace = true

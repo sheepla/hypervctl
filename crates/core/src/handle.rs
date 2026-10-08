@@ -5,6 +5,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::actor::{self, Command};
 use crate::checkpoint::{Checkpoint, CheckpointId};
 use crate::error::HyperVError;
+use crate::events::ChangeEvent;
 use crate::hyper_v::RequestedState;
 use crate::ids::{SwitchId, VmId};
 use crate::job::{JobRef, JobStatus, Pending};
@@ -111,5 +112,12 @@ impl BackendHandle {
 
     pub async fn job_status(&self, job: JobRef) -> Result<JobStatus, HyperVError> {
         self.call(|tx| Command::JobStatus { job, tx }).await
+    }
+
+    /// Starts a stream of change notifications (design 3.4).
+    pub async fn subscribe_changes(
+        &self,
+    ) -> Result<mpsc::UnboundedReceiver<ChangeEvent>, HyperVError> {
+        self.call(Command::SubscribeChanges).await
     }
 }

@@ -9,14 +9,18 @@
 
 use std::collections::HashMap;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use hypervctl_core::vhd::vhd_path_eq;
 use hypervctl_core::{
-    Checkpoint, CheckpointId, CheckpointKind, HyperV, HyperVError, JobRef, JobStatus, Pending,
-    RawError, RequestedState, SwitchDetail, SwitchId, SwitchSummary, TargetKind, VhdAttachment,
-    VhdInfo, VmDetail, VmId, VmState, VmSummary,
+    ChangeEvent, Checkpoint, CheckpointId, CheckpointKind, HyperV, HyperVError, JobRef, JobStatus,
+    Pending, RawError, RequestedState, SwitchDetail, SwitchId, SwitchSummary, TargetKind,
+    VhdAttachment, VhdInfo, VmDetail, VmId, VmState, VmSummary,
 };
+use tokio::sync::mpsc::{self, UnboundedSender};
+// A paused test clock is honoured when the mock runs on a runtime thread;
+// on a plain thread this falls back to the system clock.
+use tokio::time::Instant;
 use uuid::Uuid;
 
 mod fixture;
@@ -56,7 +60,11 @@ pub struct MockBackend {
     attachments: Vec<VhdAttachment>,
     transitions: HashMap<VmId, Transition>,
     jobs: HashMap<JobRef, VmId>,
-    next_id: u64,
+    next_job: u64,
+    next_checkpoint: u64,
+    change_listeners: Vec<UnboundedSender<ChangeEvent>>,
+    job_hold_polls: Option<u32>,
+    job_polls: HashMap<JobRef, u32>,
     tick_mode: TickMode,
     transition_delay: Duration,
     injected_error: Option<HyperVError>,
@@ -80,7 +88,11 @@ impl MockBackend {
             attachments: Vec::new(),
             transitions: HashMap::new(),
             jobs: HashMap::new(),
-            next_id: 0,
+            next_job: 0,
+            next_checkpoint: 0,
+            change_listeners: Vec::new(),
+            job_hold_polls: None,
+            job_polls: HashMap::new(),
             tick_mode: TickMode::Automatic,
             transition_delay: DEFAULT_TRANSITION_DELAY,
             injected_error: None,
@@ -110,6 +122,13 @@ impl MockBackend {
     /// Makes the next call block for `delay`.
     pub fn inject_delay(&mut self, delay: Duration) {
         self.injected_delay = Some(delay);
+    }
+
+    /// Keeps every job Running for its first polls queries, whatever the
+    /// clock says, and finished after that. Tests use it to reach a timeout and
+    /// then watch the very same job finish, without waiting (design 3.5).
+    pub fn hold_jobs_for_polls(&mut self, polls: u32) {
+        self.job_hold_polls = Some(polls);
     }
 
     pub fn set_transition_delay(&mut self, delay: Duration) {
@@ -150,7 +169,15 @@ impl MockBackend {
             if let Ok(vm) = self.vm_mut(id) {
                 vm.summary.state = transition.target;
             }
+            self.announce(ChangeEvent::Vms);
         }
+    }
+
+    /// Tells everyone who subscribed that something changed (design 3.4). A
+    /// listener whose channel closed is dropped instead of being written to.
+    fn announce(&mut self, event: ChangeEvent) {
+        self.change_listeners
+            .retain(|listener| listener.send(event.clone()).is_ok());
     }
 
     fn vm_mut(&mut self, id: VmId) -> Result<&mut VmDetail, HyperVError> {
@@ -165,16 +192,16 @@ impl MockBackend {
     }
 
     fn new_job(&mut self, vm: VmId) -> JobRef {
-        self.next_id += 1;
-        let job = JobRef::new(format!("mock-job-{}", self.next_id));
+        self.next_job += 1;
+        let job = JobRef::new(format!("mock-job-{}", self.next_job));
         self.jobs.insert(job.clone(), vm);
         job
     }
 
     fn next_checkpoint_id(&mut self) -> CheckpointId {
-        self.next_id += 1;
+        self.next_checkpoint += 1;
         CheckpointId::new(Uuid::from_u128(u128::from(
-            0x00C0_0000_0000_0000_u64 + self.next_id,
+            0x00C0_0000_0000_0000_u64 + self.next_checkpoint,
         )))
     }
 }
@@ -273,6 +300,7 @@ impl HyperV for MockBackend {
                 due: Instant::now() + self.transition_delay,
             },
         );
+        self.announce(ChangeEvent::Vms);
         if request == RequestedState::ShutDown {
             // No job exists for a guest shutdown; the state is the progress.
             return Ok(Pending::AwaitState(id, target));
@@ -286,7 +314,7 @@ impl HyperV for MockBackend {
         let id = self.next_checkpoint_id();
         let name = name
             .map(str::to_string)
-            .unwrap_or_else(|| format!("Checkpoint {}", self.next_id));
+            .unwrap_or_else(|| format!("Checkpoint {}", self.next_checkpoint));
         let parent = self
             .checkpoints
             .iter()
@@ -305,6 +333,7 @@ impl HyperV for MockBackend {
         if let Ok(vm) = self.vm_mut(vm) {
             vm.checkpoint_count += 1;
         }
+        self.announce(ChangeEvent::Checkpoints(vm));
         Ok(Pending::Job(self.new_job(vm)))
     }
 
@@ -335,6 +364,7 @@ impl HyperV for MockBackend {
                 raw: None,
             });
         }
+        self.announce(ChangeEvent::Checkpoints(vm));
         Ok(Pending::Job(self.new_job(vm)))
     }
 
@@ -353,6 +383,7 @@ impl HyperV for MockBackend {
         if let Ok(vm) = self.vm_mut(entry.vm) {
             vm.checkpoint_count = vm.checkpoint_count.saturating_sub(1);
         }
+        self.announce(ChangeEvent::Checkpoints(entry.vm));
         Ok(Pending::Job(self.new_job(entry.vm)))
     }
 
@@ -362,11 +393,25 @@ impl HyperV for MockBackend {
             self.jobs.get(&job).copied().ok_or_else(|| {
                 HyperVError::backend(RawError::new(format!("unknown job '{job}'")))
             })?;
+        if let Some(hold) = self.job_hold_polls {
+            let seen = self.job_polls.entry(job).or_insert(0);
+            if *seen < hold {
+                *seen += 1;
+                return Ok(JobStatus::Running(None));
+            }
+            return Ok(JobStatus::Succeeded);
+        }
         if self.transitions.contains_key(&vm) {
             Ok(JobStatus::Running(None))
         } else {
             Ok(JobStatus::Succeeded)
         }
+    }
+
+    fn subscribe_changes(&mut self) -> Result<mpsc::UnboundedReceiver<ChangeEvent>, HyperVError> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.change_listeners.push(tx);
+        Ok(rx)
     }
 }
 

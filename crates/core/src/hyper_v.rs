@@ -5,8 +5,11 @@
 
 use std::fmt;
 
+use tokio::sync::mpsc;
+
 use crate::checkpoint::{Checkpoint, CheckpointId};
 use crate::error::HyperVError;
+use crate::events::ChangeEvent;
 use crate::ids::{SwitchId, VmId};
 use crate::switch::{SwitchDetail, SwitchSummary};
 use crate::vhd::{VhdAttachment, VhdInfo};
@@ -92,6 +95,11 @@ pub trait HyperV {
     fn remove_checkpoint(&mut self, checkpoint: CheckpointId) -> Result<Pending, HyperVError>;
 
     fn job_status(&mut self, job: JobRef) -> Result<JobStatus, HyperVError>;
+
+    /// Starts a stream of change notifications (design 3.4). Every subscription
+    /// is independent: re-subscribing is how the frontend recovers from a lost
+    /// stream, so the backend must not assume it is called only once.
+    fn subscribe_changes(&mut self) -> Result<mpsc::UnboundedReceiver<ChangeEvent>, HyperVError>;
 }
 
 #[cfg(test)]
@@ -176,6 +184,13 @@ mod tests {
 
         fn job_status(&mut self, _job: JobRef) -> Result<JobStatus, HyperVError> {
             Err(HyperVError::backend(crate::error::RawError::new("stub")))
+        }
+
+        fn subscribe_changes(
+            &mut self,
+        ) -> Result<mpsc::UnboundedReceiver<ChangeEvent>, HyperVError> {
+            let (_tx, rx) = mpsc::unbounded_channel();
+            Ok(rx)
         }
     }
 }

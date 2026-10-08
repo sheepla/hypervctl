@@ -10,6 +10,7 @@ use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 
 use crate::checkpoint::{Checkpoint, CheckpointId};
 use crate::error::{HyperVError, RawError};
+use crate::events::ChangeEvent;
 use crate::handle::BackendHandle;
 use crate::hyper_v::{HyperV, RequestedState};
 use crate::ids::{SwitchId, VmId};
@@ -70,6 +71,7 @@ pub(crate) enum Command {
         job: JobRef,
         tx: Reply<JobStatus>,
     },
+    SubscribeChanges(Reply<tokio_mpsc::UnboundedReceiver<ChangeEvent>>),
 }
 
 impl Command {
@@ -112,6 +114,9 @@ impl Command {
             }
             Command::JobStatus { job, tx } => {
                 let _ = tx.send(backend.job_status(job));
+            }
+            Command::SubscribeChanges(tx) => {
+                let _ = tx.send(backend.subscribe_changes());
             }
         }
     }
