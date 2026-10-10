@@ -60,6 +60,16 @@ impl Cell {
         width(&self.text)
     }
 
+    /// The text of the cell, for the frontends that render it themselves.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// The colour the cell asks for, if any.
+    pub fn color(&self) -> Option<Color> {
+        self.color
+    }
+
     fn write(&self, out: &mut String, text: &str, pad: usize, paint: bool) {
         if paint {
             if let Some(color) = self.color {

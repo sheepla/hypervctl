@@ -148,12 +148,21 @@ impl BackendActor {
     }
 }
 
+/// The message of the error that says the actor is already gone.
+pub(crate) const UNREACHABLE_MESSAGE: &str = "the backend actor is not running";
+
+/// The message of the error that says the actor died mid-call.
+pub(crate) const STOPPED_MESSAGE: &str = "the backend actor stopped before replying";
+
 /// Sent by a caller when it cannot reach the actor at all.
 pub(crate) fn unreachable_error() -> HyperVError {
-    HyperVError::backend(RawError::new("the backend actor is not running"))
+    HyperVError::backend(RawError::new(UNREACHABLE_MESSAGE))
 }
 
 /// Sent by a caller when the actor dies without answering.
-pub(crate) fn stopped_error() -> HyperVError {
-    HyperVError::backend(RawError::new("the backend actor stopped before replying"))
+///
+/// Public so that a frontend can build the very error it has to recognise as
+/// fatal (design 5.5).
+pub fn stopped_error() -> HyperVError {
+    HyperVError::backend(RawError::new(STOPPED_MESSAGE))
 }

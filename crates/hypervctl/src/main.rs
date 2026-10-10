@@ -1,6 +1,7 @@
 //! `hypervctl` binary: the command line frontend (design 4.1 and 4.2).
 
 mod cli;
+mod tui;
 
 use std::io::Write;
 use std::process::ExitCode;

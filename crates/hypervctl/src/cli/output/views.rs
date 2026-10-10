@@ -46,6 +46,11 @@ fn state_parts(state: VmState) -> Parts {
     }
 }
 
+/// The word a state is shown as, for every frontend (design 4.4 and 5.9).
+pub fn state_label(state: VmState) -> String {
+    state_parts(state).0
+}
+
 fn checkpoint_kind_parts(kind: CheckpointKind) -> Parts {
     match kind {
         CheckpointKind::Standard => known("Standard", "standard"),

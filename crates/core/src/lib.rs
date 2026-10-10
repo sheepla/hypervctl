@@ -20,7 +20,7 @@ pub mod target;
 pub mod vhd;
 pub mod vm;
 
-pub use actor::BackendActor;
+pub use actor::{stopped_error, BackendActor};
 pub use checkpoint::{Checkpoint, CheckpointKind};
 pub use error::{HyperVError, RawError, UnavailableReason};
 pub use events::{ChangeEvent, ChangeWatcher, DEBOUNCE, RECONNECT_DELAY};

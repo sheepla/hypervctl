@@ -79,7 +79,7 @@ impl fmt::Display for UnavailableReason {
 }
 
 /// An error, classified for the frontend.
-#[derive(Debug, Error, PartialEq)]
+#[derive(Debug, Clone, Error, PartialEq)]
 pub enum HyperVError {
     #[error("permission denied")]
     PermissionDenied { raw: Option<RawError> },
@@ -163,6 +163,18 @@ impl HyperVError {
             Self::Timeout { .. } => "timeout",
             Self::JobFailed { .. } => "job_failed",
             Self::Backend { .. } => "backend",
+        }
+    }
+
+    /// Whether this error says the backend actor stopped, which the TUI treats
+    /// as fatal (design 5.5).
+    pub fn is_backend_stopped(&self) -> bool {
+        match self {
+            Self::Backend { raw } => {
+                raw.message == crate::actor::STOPPED_MESSAGE
+                    || raw.message == crate::actor::UNREACHABLE_MESSAGE
+            }
+            _ => false,
         }
     }
 }
@@ -250,5 +262,13 @@ mod tests {
             raw: None,
         };
         assert_eq!(error.to_string(), "Hyper-V job 32770 failed: not supported");
+    }
+
+    #[test]
+    fn only_the_actor_stop_is_reported_as_such() {
+        assert!(crate::actor::stopped_error().is_backend_stopped());
+        assert!(crate::actor::unreachable_error().is_backend_stopped());
+        assert!(!HyperVError::backend(RawError::new("something else")).is_backend_stopped());
+        assert!(!HyperVError::PermissionDenied { raw: None }.is_backend_stopped());
     }
 }

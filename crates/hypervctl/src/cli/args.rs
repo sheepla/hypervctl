@@ -118,6 +118,12 @@ pub enum Resource {
         #[command(subcommand)]
         command: VhdCommand,
     },
+    /// The full-screen terminal interface
+    Tui {
+        /// Seconds between automatic refreshes of the VM list
+        #[arg(long, value_name = "sec", default_value = "2")]
+        refresh: u64,
+    },
 }
 
 /// The verbs of `vm` (spec 2.3).

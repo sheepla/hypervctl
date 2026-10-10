@@ -3,6 +3,7 @@
 
 pub mod checkpoint;
 pub mod switch;
+pub mod tui;
 pub mod vhd;
 pub mod vm;
 
@@ -62,6 +63,7 @@ pub async fn run(
         Resource::Checkpoint { command } => checkpoint::run(command, ops, context).await,
         Resource::Switch { command } => switch::run(command, ops, context).await,
         Resource::Vhd { command } => vhd::run(command, ops, context).await,
+        Resource::Tui { refresh } => tui::run(*refresh, ops, context).await,
     }
 }
 

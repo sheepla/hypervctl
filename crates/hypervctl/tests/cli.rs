@@ -408,3 +408,15 @@ fn an_operation_verb_still_takes_the_global_options_after_itself() {
         .unwrap_or_else(|error| panic!("the JSON must parse: {error}"));
     assert_eq!(parsed[0]["status"], "succeeded");
 }
+
+#[test]
+fn the_tui_refuses_to_run_without_an_interactive_terminal() {
+    // Piped stdin and stdout are no terminal; the TUI says so and leaves with
+    // the usage code (spec 3.1).
+    let output = run(&["tui"]);
+    assert_eq!(status(&output), 2, "{}", stderr(&output));
+    assert!(stdout(&output).is_empty(), "{}", stdout(&output));
+    let err = stderr(&output);
+    assert!(err.contains("error:"), "{err:?}");
+    assert!(err.contains("interactive terminal"), "{err:?}");
+}
