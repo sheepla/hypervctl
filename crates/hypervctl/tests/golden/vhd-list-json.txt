@@ -1,0 +1,17 @@
+[
+  {
+    "vm": "web-01",
+    "vm_id": "00000001-0000-0000-0000-000000000000",
+    "controller": "scsi",
+    "controller_number": 0,
+    "controller_lun": 0,
+    "controller_raw": null,
+    "path": "C:\\HyperV\\web-01\\disk.vhdx",
+    "format": "vhdx",
+    "format_raw": null,
+    "kind": "dynamic",
+    "kind_raw": null,
+    "virtual_size_bytes": 68719476736,
+    "file_size_bytes": 4294967296
+  }
+]

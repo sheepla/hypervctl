@@ -12,8 +12,9 @@ use tokio::time::{sleep, sleep_until, Instant};
 use crate::error::{HyperVError, RawError};
 use crate::handle::BackendHandle;
 use crate::hyper_v::RequestedState;
-use crate::ids::{CheckpointId, VmId};
+use crate::ids::{CheckpointId, SwitchId, VmId};
 use crate::job::{JobRef, JobStatus, Pending};
+use crate::switch::SwitchSummary;
 use crate::target::{Candidate, Target, TargetKind};
 use crate::vm::VmState;
 
@@ -308,6 +309,38 @@ impl Operations {
                     .map(|checkpoint| Candidate {
                         target: Target::Checkpoint(checkpoint.id),
                         name: checkpoint.name.clone(),
+                    })
+                    .collect(),
+                raw: None,
+            }),
+        }
+    }
+
+    /// Resolves a switch by GUID or by exact name (spec 2.6).
+    pub async fn resolve_switch(&self, spec: &str) -> Result<SwitchId, HyperVError> {
+        if let Ok(id) = spec.parse::<SwitchId>() {
+            return Ok(id);
+        }
+        let switches = self.handle.list_switches().await?;
+        let hits: Vec<&SwitchSummary> = switches
+            .iter()
+            .filter(|switch| switch.name == spec)
+            .collect();
+        match hits.as_slice() {
+            [] => Err(HyperVError::NotFound {
+                kind: TargetKind::Switch,
+                specified: spec.to_string(),
+                raw: None,
+            }),
+            [one] => Ok(one.id),
+            many => Err(HyperVError::Ambiguous {
+                kind: TargetKind::Switch,
+                specified: spec.to_string(),
+                candidates: many
+                    .iter()
+                    .map(|switch| Candidate {
+                        target: Target::Switch(switch.id),
+                        name: switch.name.clone(),
                     })
                     .collect(),
                 raw: None,

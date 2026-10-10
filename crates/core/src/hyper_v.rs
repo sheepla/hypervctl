@@ -12,7 +12,7 @@ use crate::error::HyperVError;
 use crate::events::ChangeEvent;
 use crate::ids::{SwitchId, VmId};
 use crate::switch::{SwitchDetail, SwitchSummary};
-use crate::vhd::{VhdAttachment, VhdInfo};
+use crate::vhd::{AttachedVhd, VhdInfo};
 use crate::vm::{VmDetail, VmSummary};
 
 use crate::job::{JobRef, JobStatus, Pending};
@@ -72,8 +72,9 @@ pub trait HyperV {
 
     fn get_switch(&mut self, id: SwitchId) -> Result<SwitchDetail, HyperVError>;
 
-    /// All attachments, or only those of one VM when `vm` is given.
-    fn list_vhds(&mut self, vm: Option<VmId>) -> Result<Vec<VhdAttachment>, HyperVError>;
+    /// Every attachment with its file information, or only those of one VM
+    /// when `vm` is given (design 3.1).
+    fn list_vhds(&mut self, vm: Option<VmId>) -> Result<Vec<AttachedVhd>, HyperVError>;
 
     /// Disk information for a path, whether or not it is attached.
     fn get_vhd(&mut self, path: &str) -> Result<VhdInfo, HyperVError>;
@@ -146,7 +147,7 @@ mod tests {
             Err(HyperVError::backend(crate::error::RawError::new("stub")))
         }
 
-        fn list_vhds(&mut self, _vm: Option<VmId>) -> Result<Vec<VhdAttachment>, HyperVError> {
+        fn list_vhds(&mut self, _vm: Option<VmId>) -> Result<Vec<AttachedVhd>, HyperVError> {
             Ok(Vec::new())
         }
 

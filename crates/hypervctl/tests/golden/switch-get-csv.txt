@@ -1,0 +1,2 @@
+id,name,kind,kind_raw,uplink,management_os_shared,vlan_mode,vlan_mode_raw,vlan_access_id,vlan_native_id,connected_vm_ids
+00000200-0000-0000-0000-000000000000,test-external,external,,Ethernet,false,disabled,,,,"00000001-0000-0000-0000-000000000000, 00000005-0000-0000-0000-000000000000"

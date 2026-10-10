@@ -1,0 +1,2 @@
+vm,vm_id,controller,controller_number,controller_lun,controller_raw,path,format,format_raw,kind,kind_raw,virtual_size_bytes,file_size_bytes
+web-01,00000001-0000-0000-0000-000000000000,scsi,0,0,,C:\HyperV\web-01\disk.vhdx,vhdx,,dynamic,,68719476736,4294967296

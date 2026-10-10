@@ -6,9 +6,9 @@ use std::thread;
 use std::time::Duration;
 
 use hypervctl_core::{
-    BackendActor, ChangeEvent, Checkpoint, CheckpointId, HyperV, HyperVError, JobRef, JobStatus,
-    Pending, RawError, RequestedState, SwitchDetail, SwitchId, SwitchSummary, VhdAttachment,
-    VhdInfo, VmDetail, VmId, VmState, VmSummary,
+    AttachedVhd, BackendActor, ChangeEvent, Checkpoint, CheckpointId, HyperV, HyperVError, JobRef,
+    JobStatus, Pending, RawError, RequestedState, SwitchDetail, SwitchId, SwitchSummary, VhdInfo,
+    VmDetail, VmId, VmState, VmSummary,
 };
 
 fn no_notifications() -> Result<tokio::sync::mpsc::UnboundedReceiver<ChangeEvent>, HyperVError> {
@@ -50,7 +50,7 @@ impl HyperV for NotSendBackend {
         Err(unused())
     }
 
-    fn list_vhds(&mut self, _vm: Option<VmId>) -> Result<Vec<VhdAttachment>, HyperVError> {
+    fn list_vhds(&mut self, _vm: Option<VmId>) -> Result<Vec<AttachedVhd>, HyperVError> {
         Ok(Vec::new())
     }
 
@@ -127,7 +127,7 @@ impl HyperV for PanickingBackend {
         Err(unused())
     }
 
-    fn list_vhds(&mut self, _vm: Option<VmId>) -> Result<Vec<VhdAttachment>, HyperVError> {
+    fn list_vhds(&mut self, _vm: Option<VmId>) -> Result<Vec<AttachedVhd>, HyperVError> {
         Ok(Vec::new())
     }
 

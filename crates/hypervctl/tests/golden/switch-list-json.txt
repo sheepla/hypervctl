@@ -1,0 +1,30 @@
+[
+  {
+    "id": "00000202-0000-0000-0000-000000000000",
+    "name": "dup-switch",
+    "kind": "private",
+    "kind_raw": null,
+    "uplink": null
+  },
+  {
+    "id": "00000203-0000-0000-0000-000000000000",
+    "name": "dup-switch",
+    "kind": "private",
+    "kind_raw": null,
+    "uplink": null
+  },
+  {
+    "id": "00000200-0000-0000-0000-000000000000",
+    "name": "test-external",
+    "kind": "external",
+    "kind_raw": null,
+    "uplink": "Ethernet"
+  },
+  {
+    "id": "00000201-0000-0000-0000-000000000000",
+    "name": "test-priv",
+    "kind": "private",
+    "kind_raw": null,
+    "uplink": null
+  }
+]

@@ -8,7 +8,7 @@ use std::time::Duration;
 use hypervctl_backend_mock::MockBackend;
 use hypervctl_core::{
     BackendActor, HyperVError, JobRef, JobStatus, OpOutcome, OpSuccess, Operations, Pending, Phase,
-    Progress, VmOp, VmState, WaitPolicy,
+    Progress, TargetKind, VmOp, VmState, WaitPolicy,
 };
 
 fn specs(names: &[&str]) -> Vec<String> {
@@ -298,7 +298,7 @@ async fn no_wait_returns_right_after_the_backend_accepts() {
 #[tokio::test(start_paused = true)]
 async fn a_guid_is_used_verbatim_and_never_ambiguous() {
     let ops = operations(fixture()).await;
-    let id = ok(ops.resolve_vm("00000000-0000-0000-0000-000000000003").await);
+    let id = ok(ops.resolve_vm("00000003-0000-0000-0000-000000000000").await);
     let vm = ok(ops.handle().get_vm(id).await);
     assert_eq!(vm.summary.name, "db-01");
     assert_eq!(vm.summary.state, VmState::Saved);
@@ -350,5 +350,28 @@ async fn restoring_a_running_vm_is_rejected_before_anything_starts() {
         Err(HyperVError::InvalidState { state, .. }) => assert_eq!(state, VmState::Running),
         Err(other) => panic!("expected an invalid state, got {other}"),
         Ok(success) => panic!("expected a failure, got {success:?}"),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_switch_resolves_by_name_or_guid_but_never_by_guesswork() {
+    let ops = operations(fixture()).await;
+    let by_name = ok(ops.resolve_switch("test-priv").await);
+    let by_guid = ok(ops.resolve_switch(&by_name.to_string()).await);
+    assert_eq!(by_name, by_guid);
+
+    match ops.resolve_switch("no-such-switch").await {
+        Err(HyperVError::NotFound {
+            kind, specified, ..
+        }) => {
+            assert_eq!(kind, TargetKind::Switch);
+            assert_eq!(specified, "no-such-switch");
+        }
+        other => panic!("expected a not-found switch, got {other:?}"),
+    }
+
+    match ops.resolve_switch("dup-switch").await {
+        Err(HyperVError::Ambiguous { candidates, .. }) => assert_eq!(candidates.len(), 2),
+        other => panic!("expected an ambiguous switch, got {other:?}"),
     }
 }

@@ -1,0 +1,2 @@
+VM      CONTROLLER  PATH                        FORMAT  TYPE     SIZE     FILE
+web-01  SCSI 0:0    C:\HyperV\web-01\disk.vhdx  Vhdx    Dynamic  64.0 GB  4.0 GB

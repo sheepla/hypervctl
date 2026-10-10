@@ -17,8 +17,14 @@ use crate::{CheckpointEntry, MockBackend};
 
 const GIB: u64 = 1024 * 1024 * 1024;
 
-fn id(n: u128) -> VmId {
-    VmId::new(Uuid::from_u128(n))
+/// The fixture keeps its identifiers in the most significant bits, so that the
+/// eight characters `table` prints for an id still tell the objects apart.
+pub(crate) fn uuid(n: u128) -> Uuid {
+    Uuid::from_u128(n << 96)
+}
+
+pub(crate) fn id(n: u128) -> VmId {
+    VmId::new(uuid(n))
 }
 
 fn vm(
@@ -101,8 +107,8 @@ impl MockBackend {
             vm(6, "dup", VmState::Off, 2, 2, 1, 0),
         ];
 
-        let root = CheckpointId::new(Uuid::from_u128(0x100));
-        let child = CheckpointId::new(Uuid::from_u128(0x101));
+        let root = CheckpointId::new(uuid(0x100));
+        let child = CheckpointId::new(uuid(0x101));
         backend.checkpoints = vec![
             CheckpointEntry {
                 vm: id(1),
@@ -129,7 +135,7 @@ impl MockBackend {
         backend.switches = vec![
             SwitchDetail {
                 summary: SwitchSummary {
-                    id: SwitchId::new(Uuid::from_u128(0x200)),
+                    id: SwitchId::new(uuid(0x200)),
                     name: "test-external".to_string(),
                     kind: SwitchKind::External,
                     uplink: Some("Ethernet".to_string()),
@@ -140,12 +146,35 @@ impl MockBackend {
             },
             SwitchDetail {
                 summary: SwitchSummary {
-                    id: SwitchId::new(Uuid::from_u128(0x201)),
+                    id: SwitchId::new(uuid(0x201)),
                     name: "test-priv".to_string(),
                     kind: SwitchKind::Private,
                     uplink: None,
                 },
                 management_os_shared: true,
+                vlans: VlanSettings::default(),
+                connected_vm_ids: Vec::new(),
+            },
+            // Two switches with the same name, for the Ambiguous case.
+            SwitchDetail {
+                summary: SwitchSummary {
+                    id: SwitchId::new(uuid(0x202)),
+                    name: "dup-switch".to_string(),
+                    kind: SwitchKind::Private,
+                    uplink: None,
+                },
+                management_os_shared: false,
+                vlans: VlanSettings::default(),
+                connected_vm_ids: Vec::new(),
+            },
+            SwitchDetail {
+                summary: SwitchSummary {
+                    id: SwitchId::new(uuid(0x203)),
+                    name: "dup-switch".to_string(),
+                    kind: SwitchKind::Private,
+                    uplink: None,
+                },
+                management_os_shared: false,
                 vlans: VlanSettings::default(),
                 connected_vm_ids: Vec::new(),
             },

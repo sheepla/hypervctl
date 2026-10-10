@@ -1,0 +1,10 @@
+Name              test-external
+Id                00000200
+Type              External
+Uplink            Ethernet
+Management OS     not shared
+VLAN mode         Disabled
+VLAN access id    -
+VLAN native id    -
+VLAN allowed ids  -
+Connected VMs     web-01, dup

@@ -16,7 +16,7 @@ use crate::hyper_v::{HyperV, RequestedState};
 use crate::ids::{SwitchId, VmId};
 use crate::job::{JobRef, JobStatus, Pending};
 use crate::switch::{SwitchDetail, SwitchSummary};
-use crate::vhd::{VhdAttachment, VhdInfo};
+use crate::vhd::{AttachedVhd, VhdInfo};
 use crate::vm::{VmDetail, VmSummary};
 
 /// Bound on queued commands. The frontends never queue this many at once.
@@ -42,7 +42,7 @@ pub(crate) enum Command {
     },
     ListVhds {
         vm: Option<VmId>,
-        tx: Reply<Vec<VhdAttachment>>,
+        tx: Reply<Vec<AttachedVhd>>,
     },
     GetVhd {
         path: String,

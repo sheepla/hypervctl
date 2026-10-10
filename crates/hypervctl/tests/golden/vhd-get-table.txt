@@ -1,0 +1,8 @@
+Path          C:\HyperV\web-01\disk.vhdx
+Format        Vhdx
+Type          Dynamic
+Virtual size  64.0 GB
+File size     4.0 GB
+Block size    32.0 MB
+Parent path   -
+Disk id       -

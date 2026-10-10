@@ -45,6 +45,15 @@ pub struct VhdInfo {
     pub disk_id: Option<String>,
 }
 
+/// An attachment together with the file behind it, as `vhd list` reports them.
+/// The columns about the slot come from the attachment; the ones about the
+/// file (format, sizes) stay unknown when the file is gone or unreadable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachedVhd {
+    pub attachment: VhdAttachment,
+    pub info: Option<VhdInfo>,
+}
+
 /// Container format of a virtual disk file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum VhdFormat {

@@ -1,0 +1,5 @@
+id,name,kind,kind_raw,uplink
+00000202-0000-0000-0000-000000000000,dup-switch,private,,
+00000203-0000-0000-0000-000000000000,dup-switch,private,,
+00000200-0000-0000-0000-000000000000,test-external,external,,Ethernet
+00000201-0000-0000-0000-000000000000,test-priv,private,,

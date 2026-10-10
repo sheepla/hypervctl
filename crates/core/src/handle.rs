@@ -10,7 +10,7 @@ use crate::hyper_v::RequestedState;
 use crate::ids::{SwitchId, VmId};
 use crate::job::{JobRef, JobStatus, Pending};
 use crate::switch::{SwitchDetail, SwitchSummary};
-use crate::vhd::{VhdAttachment, VhdInfo};
+use crate::vhd::{AttachedVhd, VhdInfo};
 use crate::vm::{VmDetail, VmSummary};
 
 /// Async front door to a backend running on its own thread (design 3.2).
@@ -65,7 +65,7 @@ impl BackendHandle {
         self.call(|tx| Command::GetSwitch { id, tx }).await
     }
 
-    pub async fn list_vhds(&self, vm: Option<VmId>) -> Result<Vec<VhdAttachment>, HyperVError> {
+    pub async fn list_vhds(&self, vm: Option<VmId>) -> Result<Vec<AttachedVhd>, HyperVError> {
         self.call(|tx| Command::ListVhds { vm, tx }).await
     }
 

@@ -1,0 +1,17 @@
+{
+  "id": "00000200-0000-0000-0000-000000000000",
+  "name": "test-external",
+  "kind": "external",
+  "kind_raw": null,
+  "uplink": "Ethernet",
+  "management_os_shared": false,
+  "vlan_mode": "disabled",
+  "vlan_mode_raw": null,
+  "vlan_access_id": null,
+  "vlan_native_id": null,
+  "vlan_allowed_ids": [],
+  "connected_vm_ids": [
+    "00000001-0000-0000-0000-000000000000",
+    "00000005-0000-0000-0000-000000000000"
+  ]
+}

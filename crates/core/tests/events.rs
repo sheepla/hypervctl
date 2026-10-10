@@ -4,15 +4,16 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hypervctl_backend_mock::MockBackend;
 use hypervctl_core::{
-    BackendActor, BackendHandle, ChangeEvent, ChangeWatcher, Checkpoint, CheckpointId, HyperV,
-    HyperVError, JobRef, JobStatus, Pending, RawError, RequestedState, SwitchDetail, SwitchId,
-    SwitchSummary, VhdAttachment, VhdInfo, VmDetail, VmId, VmSummary, RECONNECT_DELAY,
+    AttachedVhd, BackendActor, BackendHandle, ChangeEvent, ChangeWatcher, Checkpoint, CheckpointId,
+    HyperV, HyperVError, JobRef, JobStatus, Pending, RawError, RequestedState, SwitchDetail,
+    SwitchId, SwitchSummary, VhdInfo, VmDetail, VmId, VmSummary, DEBOUNCE, RECONNECT_DELAY,
 };
 use tokio::sync::mpsc as tokio_mpsc;
+use tokio::sync::mpsc::error::TryRecvError;
 
 type Stream = tokio_mpsc::UnboundedReceiver<ChangeEvent>;
 
@@ -59,7 +60,7 @@ impl HyperV for StreamingBackend {
         Err(unused())
     }
 
-    fn list_vhds(&mut self, _vm: Option<VmId>) -> Result<Vec<VhdAttachment>, HyperVError> {
+    fn list_vhds(&mut self, _vm: Option<VmId>) -> Result<Vec<AttachedVhd>, HyperVError> {
         Ok(Vec::new())
     }
 
@@ -113,13 +114,42 @@ fn streaming_backend() -> (BackendHandle, std_mpsc::Sender<Stream>, Arc<AtomicUs
 }
 
 /// Lets the watcher run and fires whatever reconnect delay it is waiting for.
+///
+/// The backend answers from a thread of its own, and no clock the test drives
+/// can hurry that thread along. The wait therefore spins until the attempt
+/// shows up, bounded by the *real* clock, and steps the paused clock forward
+/// for the timers in between. Spinning also keeps the runtime from parking:
+/// a parked runtime would jump the paused clock straight past any timeout the
+/// test is still waiting on, which is what makes these tests flaky under load.
 async fn pump(attempts: &AtomicUsize, want: usize) {
-    for _ in 0..100 {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while attempts.load(Ordering::SeqCst) < want {
+        assert!(
+            Instant::now() < deadline,
+            "the watcher must reach {want} subscription attempts, has {}",
+            attempts.load(Ordering::SeqCst)
+        );
         tokio::task::yield_now().await;
         tokio::time::advance(RECONNECT_DELAY).await;
-        if attempts.load(Ordering::SeqCst) >= want {
-            return;
+    }
+}
+
+/// Takes one notification off the watcher, stepping the debounce forward
+/// instead of waiting for a timer that a paused clock would fire at once.
+async fn next_event(received: &mut Stream) -> ChangeEvent {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match received.try_recv() {
+            Ok(event) => return event,
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => panic!("the watcher must keep its output open"),
         }
+        assert!(
+            Instant::now() < deadline,
+            "no notification arrived within ten seconds"
+        );
+        tokio::task::yield_now().await;
+        tokio::time::advance(DEBOUNCE).await;
     }
 }
 
@@ -136,10 +166,11 @@ async fn a_burst_of_the_same_notification_arrives_once() {
     let _ = stream_tx.send(ChangeEvent::Vms);
     let _ = stream_tx.send(ChangeEvent::Vms);
 
-    match tokio::time::timeout(Duration::from_secs(10), received.recv()).await {
-        Ok(Some(ChangeEvent::Vms)) => {}
-        other => panic!("expected one Vms notification, got {other:?}"),
-    }
+    assert_eq!(
+        next_event(&mut received).await,
+        ChangeEvent::Vms,
+        "expected one Vms notification"
+    );
     assert!(
         received.try_recv().is_err(),
         "the burst must be folded into a single notification"
@@ -159,12 +190,13 @@ async fn notifications_that_differ_are_not_merged() {
     let _ = stream_tx.send(ChangeEvent::Vms);
     let _ = stream_tx.send(ChangeEvent::Checkpoints(vm));
 
-    match tokio::time::timeout(Duration::from_secs(10), received.recv()).await {
-        Ok(Some(ChangeEvent::Vms)) => {}
-        other => panic!("expected Vms first, got {other:?}"),
-    }
-    match tokio::time::timeout(Duration::from_secs(10), received.recv()).await {
-        Ok(Some(ChangeEvent::Checkpoints(found))) => assert_eq!(found, vm),
+    assert_eq!(
+        next_event(&mut received).await,
+        ChangeEvent::Vms,
+        "expected Vms first"
+    );
+    match next_event(&mut received).await {
+        ChangeEvent::Checkpoints(found) => assert_eq!(found, vm),
         other => panic!("expected the checkpoint notification, got {other:?}"),
     }
 }
@@ -181,10 +213,11 @@ async fn the_watcher_subscribes_again_after_its_stream_ends() {
 
     pump(&attempts, 1).await;
     let _ = first_tx.send(ChangeEvent::Vms);
-    match tokio::time::timeout(Duration::from_secs(10), received.recv()).await {
-        Ok(Some(ChangeEvent::Vms)) => {}
-        other => panic!("expected the first notification, got {other:?}"),
-    }
+    assert_eq!(
+        next_event(&mut received).await,
+        ChangeEvent::Vms,
+        "expected the first notification"
+    );
 
     // The stream ends and nothing is queued: the watcher notices and retries.
     drop(first_tx);
@@ -204,8 +237,8 @@ async fn the_watcher_subscribes_again_after_its_stream_ends() {
         second_tx.send(ChangeEvent::Checkpoints(vm)).is_ok(),
         "the watcher must be listening on the new stream"
     );
-    match tokio::time::timeout(Duration::from_secs(30), received.recv()).await {
-        Ok(Some(ChangeEvent::Checkpoints(found))) => assert_eq!(found, vm),
+    match next_event(&mut received).await {
+        ChangeEvent::Checkpoints(found) => assert_eq!(found, vm),
         other => panic!("expected a notification on the new stream, got {other:?}"),
     }
 }
@@ -233,18 +266,20 @@ async fn the_mock_backend_announces_its_own_changes() {
     if let Err(error) = handle.request_vm_state(web02, RequestedState::Start).await {
         panic!("expected the request to be accepted, got {error}");
     }
-    match tokio::time::timeout(Duration::from_secs(5), stream.recv()).await {
-        Ok(Some(ChangeEvent::Vms)) => {}
-        other => panic!("the request must be announced, got {other:?}"),
-    }
+    assert_eq!(
+        next_event(&mut stream).await,
+        ChangeEvent::Vms,
+        "the request must be announced"
+    );
 
     // The transition settling is announced too.
     match handle.list_vms().await {
         Ok(_) => {}
         Err(error) => panic!("expected the list, got {error}"),
     }
-    match tokio::time::timeout(Duration::from_secs(5), stream.recv()).await {
-        Ok(Some(ChangeEvent::Vms)) => {}
-        other => panic!("the settled transition must be announced, got {other:?}"),
-    }
+    assert_eq!(
+        next_event(&mut stream).await,
+        ChangeEvent::Vms,
+        "the settled transition must be announced"
+    );
 }

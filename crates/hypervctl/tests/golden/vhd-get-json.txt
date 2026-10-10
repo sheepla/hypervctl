@@ -1,0 +1,12 @@
+{
+  "path": "C:\\HyperV\\web-01\\disk.vhdx",
+  "format": "vhdx",
+  "format_raw": null,
+  "kind": "dynamic",
+  "kind_raw": null,
+  "virtual_size_bytes": 68719476736,
+  "file_size_bytes": 4294967296,
+  "block_size_bytes": 33554432,
+  "parent_path": null,
+  "disk_id": null
+}

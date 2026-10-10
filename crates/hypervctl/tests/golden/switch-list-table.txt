@@ -1,0 +1,5 @@
+NAME           ID        TYPE      UPLINK
+dup-switch     00000202  Private   -
+dup-switch     00000203  Private   -
+test-external  00000200  External  Ethernet
+test-priv      00000201  Private   -

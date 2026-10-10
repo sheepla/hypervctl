@@ -1,0 +1,51 @@
+{
+  "id": "00000001-0000-0000-0000-000000000000",
+  "name": "web-01",
+  "state": "running",
+  "state_raw": null,
+  "cpu_percent": 3.5,
+  "uptime_seconds": 3600,
+  "generation": 2,
+  "processor_count": 2,
+  "memory": {
+    "startup_bytes": 2147483648,
+    "dynamic_enabled": true,
+    "min_bytes": 1073741824,
+    "max_bytes": 4294967296
+  },
+  "disks": [
+    {
+      "path": "C:\\HyperV\\web-01\\disk.vhdx",
+      "controller": "scsi",
+      "controller_number": 0,
+      "controller_lun": 0,
+      "controller_raw": null
+    }
+  ],
+  "nics": [
+    {
+      "switch_name": "test-external",
+      "mac_address": "00:15:5d:01:02:03",
+      "ip_addresses": [
+        "192.168.1.10"
+      ]
+    }
+  ],
+  "checkpoint_count": 2,
+  "config_path": "C:\\HyperV\\web-01\\web-01.vmcx",
+  "integration_services": [
+    {
+      "name": "Heartbeat",
+      "enabled": true,
+      "status": "operational",
+      "status_raw": null
+    },
+    {
+      "name": "Time Synchronization",
+      "enabled": true,
+      "status": "operational",
+      "status_raw": null
+    }
+  ],
+  "notes": null
+}

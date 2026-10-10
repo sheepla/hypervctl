@@ -1,0 +1,2 @@
+path,format,format_raw,kind,kind_raw,virtual_size_bytes,file_size_bytes,block_size_bytes,parent_path,disk_id
+C:\HyperV\web-01\disk.vhdx,vhdx,,dynamic,,68719476736,4294967296,33554432,,

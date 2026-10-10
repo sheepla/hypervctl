@@ -13,9 +13,9 @@ use std::time::Duration;
 
 use hypervctl_core::vhd::vhd_path_eq;
 use hypervctl_core::{
-    ChangeEvent, Checkpoint, CheckpointId, CheckpointKind, HyperV, HyperVError, JobRef, JobStatus,
-    Pending, RawError, RequestedState, SwitchDetail, SwitchId, SwitchSummary, TargetKind,
-    VhdAttachment, VhdInfo, VmDetail, VmId, VmState, VmSummary,
+    AttachedVhd, ChangeEvent, Checkpoint, CheckpointId, CheckpointKind, HyperV, HyperVError,
+    JobRef, JobStatus, Pending, RawError, RequestedState, SwitchDetail, SwitchId, SwitchSummary,
+    TargetKind, VhdAttachment, VhdInfo, VmDetail, VmId, VmState, VmSummary,
 };
 use tokio::sync::mpsc::{self, UnboundedSender};
 // A paused test clock is honoured when the mock runs on a runtime thread;
@@ -254,13 +254,28 @@ impl HyperV for MockBackend {
             })
     }
 
-    fn list_vhds(&mut self, vm: Option<VmId>) -> Result<Vec<VhdAttachment>, HyperVError> {
+    fn list_vhds(&mut self, vm: Option<VmId>) -> Result<Vec<AttachedVhd>, HyperVError> {
         self.begin()?;
         Ok(self
             .attachments
             .iter()
             .filter(|attachment| vm.is_none_or(|id| attachment.vm_id == id))
-            .cloned()
+            .map(|attachment| {
+                let info = self
+                    .vhds
+                    .iter()
+                    .find(|vhd| {
+                        vhd_path_eq(
+                            vhd.path.to_string_lossy().as_ref(),
+                            attachment.path.to_string_lossy().as_ref(),
+                        )
+                    })
+                    .cloned();
+                AttachedVhd {
+                    attachment: attachment.clone(),
+                    info,
+                }
+            })
             .collect())
     }
 
@@ -424,7 +439,7 @@ mod tests {
     use super::*;
 
     fn vm_id(n: u128) -> VmId {
-        VmId::new(Uuid::from_u128(n))
+        crate::fixture::id(n)
     }
 
     /// Reports a failure with the error instead of `unwrap`/`expect`.
@@ -586,7 +601,7 @@ mod tests {
     #[test]
     fn restoring_on_a_running_vm_is_rejected_the_way_hyper_v_does() {
         let mut backend = MockBackend::with_fixture();
-        let error = err(backend.restore_checkpoint(vm_id(1), Uuid::from_u128(0x100).into()));
+        let error = err(backend.restore_checkpoint(vm_id(1), Uuid::from_u128(0x100 << 96).into()));
         assert!(matches!(
             error,
             HyperVError::InvalidState {

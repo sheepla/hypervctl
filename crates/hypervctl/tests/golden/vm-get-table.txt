@@ -1,0 +1,18 @@
+Name                           web-01
+Id                             00000001
+State                          Running
+Generation                     2
+CPU                            3.5%
+Uptime                         01:00:00
+Processors                     2
+Startup memory                 2.0 GB
+Dynamic memory                 enabled
+Minimum memory                 1.0 GB
+Maximum memory                 4.0 GB
+Checkpoint count               2
+Configuration file             C:\HyperV\web-01\web-01.vmcx
+Disk 0                         C:\HyperV\web-01\disk.vhdx  (SCSI 0:0)
+Nic 0                          test-external, 00:15:5d:01:02:03, 192.168.1.10
+Service: Heartbeat             enabled, Operational
+Service: Time Synchronization  enabled, Operational
+Notes                          -

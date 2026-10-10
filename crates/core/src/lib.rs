@@ -31,7 +31,9 @@ pub use job::{JobRef, JobStatus, Pending};
 pub use ops::{OpOutcome, OpSuccess, Operations, Phase, Progress, VmOp, WaitPolicy};
 pub use switch::{SwitchDetail, SwitchKind, SwitchSummary, VlanMode, VlanSettings};
 pub use target::{Candidate, Target, TargetKind};
-pub use vhd::{Controller, ControllerKind, VhdAttachment, VhdFormat, VhdInfo, VhdKind};
+pub use vhd::{
+    AttachedVhd, Controller, ControllerKind, VhdAttachment, VhdFormat, VhdInfo, VhdKind,
+};
 pub use vm::{
     IntegrationService, IntegrationStatus, MemoryConfig, NicConfig, VmDetail, VmState, VmSummary,
 };

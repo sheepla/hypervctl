@@ -1,0 +1,62 @@
+[
+  {
+    "id": "00000003-0000-0000-0000-000000000000",
+    "name": "db-01",
+    "state": "saved",
+    "state_raw": null,
+    "cpu_percent": null,
+    "memory_assigned_bytes": 4294967296,
+    "uptime_seconds": null,
+    "generation": 1
+  },
+  {
+    "id": "00000005-0000-0000-0000-000000000000",
+    "name": "dup",
+    "state": "running",
+    "state_raw": null,
+    "cpu_percent": 3.5,
+    "memory_assigned_bytes": 1073741824,
+    "uptime_seconds": 3600,
+    "generation": 2
+  },
+  {
+    "id": "00000006-0000-0000-0000-000000000000",
+    "name": "dup",
+    "state": "off",
+    "state_raw": null,
+    "cpu_percent": null,
+    "memory_assigned_bytes": 1073741824,
+    "uptime_seconds": null,
+    "generation": 2
+  },
+  {
+    "id": "00000004-0000-0000-0000-000000000000",
+    "name": "ghost",
+    "state": "unknown",
+    "state_raw": 42,
+    "cpu_percent": null,
+    "memory_assigned_bytes": 1073741824,
+    "uptime_seconds": null,
+    "generation": 1
+  },
+  {
+    "id": "00000001-0000-0000-0000-000000000000",
+    "name": "web-01",
+    "state": "running",
+    "state_raw": null,
+    "cpu_percent": 3.5,
+    "memory_assigned_bytes": 2147483648,
+    "uptime_seconds": 3600,
+    "generation": 2
+  },
+  {
+    "id": "00000002-0000-0000-0000-000000000000",
+    "name": "web-02",
+    "state": "off",
+    "state_raw": null,
+    "cpu_percent": null,
+    "memory_assigned_bytes": 2147483648,
+    "uptime_seconds": null,
+    "generation": 2
+  }
+]
