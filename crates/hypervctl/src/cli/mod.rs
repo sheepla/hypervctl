@@ -3,5 +3,7 @@
 
 pub mod args;
 pub mod commands;
+pub mod confirm;
 pub mod errors;
 pub mod output;
+pub mod progress;

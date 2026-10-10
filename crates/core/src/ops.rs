@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use tokio::time::{sleep, sleep_until, Instant};
 
+use crate::checkpoint::Checkpoint;
 use crate::error::{HyperVError, RawError};
 use crate::handle::BackendHandle;
 use crate::hyper_v::RequestedState;
@@ -16,7 +17,7 @@ use crate::ids::{CheckpointId, SwitchId, VmId};
 use crate::job::{JobRef, JobStatus, Pending};
 use crate::switch::SwitchSummary;
 use crate::target::{Candidate, Target, TargetKind};
-use crate::vm::VmState;
+use crate::vm::{VmState, VmSummary};
 
 /// How long to wait for a mutation to reach its goal (design 3.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,10 +67,20 @@ pub struct Progress {
     pub percent: Option<u8>,
 }
 
+/// Which entity an operation resolved to, for the result rows (design 4.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpId {
+    Vm(VmId),
+    Checkpoint(CheckpointId),
+}
+
 /// What one target's operation came to (design 3.3).
 #[derive(Debug, PartialEq)]
 pub struct OpOutcome {
+    /// The target exactly as the user typed it.
     pub target: String,
+    /// The entity the operation acted on, once the target resolved (design 4.4).
+    pub id: Option<OpId>,
     pub result: Result<OpSuccess, HyperVError>,
 }
 
@@ -256,15 +267,33 @@ impl Operations {
         if let Ok(id) = spec.parse::<VmId>() {
             return Ok(id);
         }
+        Ok(self.named_vm(spec).await?.id)
+    }
+
+    /// The VM behind a GUID or an exactly matching name (spec 2.6).
+    ///
+    /// Prompts that have to show both the name and the id of a target ask for
+    /// this (design 4.6). A GUID is looked up, so a VM that no longer exists is
+    /// `NotFound` here even though [`Self::resolve_vm`] would accept it.
+    pub async fn vm_summary(&self, spec: &str) -> Result<VmSummary, HyperVError> {
+        if let Ok(id) = spec.parse::<VmId>() {
+            return Ok(self.handle.get_vm(id).await?.summary);
+        }
+        self.named_vm(spec).await
+    }
+
+    /// The VM whose name matches exactly; zero hits are `NotFound`, many are
+    /// `Ambiguous` with their identifiers (spec 2.6).
+    async fn named_vm(&self, spec: &str) -> Result<VmSummary, HyperVError> {
         let vms = self.handle.list_vms().await?;
-        let hits: Vec<&crate::vm::VmSummary> = vms.iter().filter(|vm| vm.name == spec).collect();
+        let hits: Vec<&VmSummary> = vms.iter().filter(|vm| vm.name == spec).collect();
         match hits.as_slice() {
             [] => Err(HyperVError::NotFound {
                 kind: TargetKind::Vm,
                 specified: spec.to_string(),
                 raw: None,
             }),
-            [one] => Ok(one.id),
+            [one] => Ok((*one).clone()),
             many => Err(HyperVError::Ambiguous {
                 kind: TargetKind::Vm,
                 specified: spec.to_string(),
@@ -289,10 +318,22 @@ impl Operations {
         if let Ok(id) = spec.parse::<CheckpointId>() {
             return Ok(id);
         }
+        Ok(self.checkpoint_entry(vm, spec).await?.id)
+    }
+
+    /// The checkpoint behind a GUID or an exact name inside one VM (spec 2.6).
+    ///
+    /// Prompts that have to show both the name and the id of a target ask for
+    /// this (design 4.6).
+    pub async fn checkpoint_entry(&self, vm: VmId, spec: &str) -> Result<Checkpoint, HyperVError> {
+        let by_id = spec.parse::<CheckpointId>().ok();
         let checkpoints = self.handle.list_checkpoints(vm).await?;
-        let hits: Vec<&crate::checkpoint::Checkpoint> = checkpoints
+        let hits: Vec<&Checkpoint> = checkpoints
             .iter()
-            .filter(|checkpoint| checkpoint.name == spec)
+            .filter(|checkpoint| match by_id {
+                Some(id) => checkpoint.id == id,
+                None => checkpoint.name == spec,
+            })
             .collect();
         match hits.as_slice() {
             [] => Err(HyperVError::NotFound {
@@ -300,7 +341,7 @@ impl Operations {
                 specified: spec.to_string(),
                 raw: None,
             }),
-            [one] => Ok(one.id),
+            [one] => Ok((*one).clone()),
             many => Err(HyperVError::Ambiguous {
                 kind: TargetKind::Checkpoint,
                 specified: spec.to_string(),
@@ -361,16 +402,23 @@ impl Operations {
         for spec in specs {
             let mut ctx = Ctx::new(spec, wait, on_progress);
             notify(&mut ctx, Phase::Resolving, None);
+            let mut id = None;
             let result = match self.resolve_vm(spec).await {
                 Err(error) => Err(error),
-                Ok(id) if op.is_restart() => {
-                    self.restart(id, op == VmOp::RestartForce, &mut ctx).await
+                Ok(found) => {
+                    id = Some(OpId::Vm(found));
+                    if op.is_restart() {
+                        self.restart(found, op == VmOp::RestartForce, &mut ctx)
+                            .await
+                    } else {
+                        self.change_state(found, op, &mut ctx).await
+                    }
                 }
-                Ok(id) => self.change_state(id, op, &mut ctx).await,
             };
             notify(&mut ctx, Phase::Finished, None);
             outcomes.push(OpOutcome {
                 target: spec.clone(),
+                id,
                 result,
             });
         }
@@ -378,19 +426,34 @@ impl Operations {
     }
 
     /// Creates a checkpoint and waits for it when the policy says so.
+    ///
+    /// What the backend reports for a new checkpoint carries no identifier, so
+    /// the outcome has none either (design 4.4: include it only when it can be
+    /// had).
     pub async fn create_checkpoint(
         &self,
         vm: &str,
         name: Option<&str>,
         wait: WaitPolicy,
         on_progress: &mut (dyn FnMut(Progress) + Send),
-    ) -> Result<OpSuccess, HyperVError> {
+    ) -> OpOutcome {
         let mut ctx = Ctx::new(vm, wait, on_progress);
         notify(&mut ctx, Phase::Resolving, None);
-        let id = self.resolve_vm(vm).await?;
-        notify(&mut ctx, Phase::Requesting, None);
-        let pending = self.handle.create_checkpoint(id, name).await?;
-        self.finish(id, pending, None, &mut ctx).await
+        let result = match self.resolve_vm(vm).await {
+            Err(error) => Err(error),
+            Ok(id) => {
+                notify(&mut ctx, Phase::Requesting, None);
+                match self.handle.create_checkpoint(id, name).await {
+                    Err(error) => Err(error),
+                    Ok(pending) => self.finish(id, pending, None, &mut ctx).await,
+                }
+            }
+        };
+        OpOutcome {
+            target: vm.to_string(),
+            id: None,
+            result,
+        }
     }
 
     /// Restores a checkpoint of a VM that must not be running (M0 item 6).
@@ -400,14 +463,29 @@ impl Operations {
         checkpoint: &str,
         wait: WaitPolicy,
         on_progress: &mut (dyn FnMut(Progress) + Send),
-    ) -> Result<OpSuccess, HyperVError> {
+    ) -> OpOutcome {
         let mut ctx = Ctx::new(vm, wait, on_progress);
         notify(&mut ctx, Phase::Resolving, None);
-        let id = self.resolve_vm(vm).await?;
-        let target = self.resolve_checkpoint(id, checkpoint).await?;
-        notify(&mut ctx, Phase::Requesting, None);
-        let pending = self.handle.restore_checkpoint(id, target).await?;
-        self.finish(id, pending, None, &mut ctx).await
+        let mut id = None;
+        let result = match self.resolve_vm(vm).await {
+            Err(error) => Err(error),
+            Ok(found) => match self.resolve_checkpoint(found, checkpoint).await {
+                Err(error) => Err(error),
+                Ok(target) => {
+                    id = Some(OpId::Checkpoint(target));
+                    notify(&mut ctx, Phase::Requesting, None);
+                    match self.handle.restore_checkpoint(found, target).await {
+                        Err(error) => Err(error),
+                        Ok(pending) => self.finish(found, pending, None, &mut ctx).await,
+                    }
+                }
+            },
+        };
+        OpOutcome {
+            target: checkpoint.to_string(),
+            id,
+            result,
+        }
     }
 
     /// Removes one checkpoint; its children stay, its disks are marked for merge
@@ -418,14 +496,29 @@ impl Operations {
         checkpoint: &str,
         wait: WaitPolicy,
         on_progress: &mut (dyn FnMut(Progress) + Send),
-    ) -> Result<OpSuccess, HyperVError> {
+    ) -> OpOutcome {
         let mut ctx = Ctx::new(vm, wait, on_progress);
         notify(&mut ctx, Phase::Resolving, None);
-        let id = self.resolve_vm(vm).await?;
-        let target = self.resolve_checkpoint(id, checkpoint).await?;
-        notify(&mut ctx, Phase::Requesting, None);
-        let pending = self.handle.remove_checkpoint(target).await?;
-        self.finish(id, pending, None, &mut ctx).await
+        let mut id = None;
+        let result = match self.resolve_vm(vm).await {
+            Err(error) => Err(error),
+            Ok(found) => match self.resolve_checkpoint(found, checkpoint).await {
+                Err(error) => Err(error),
+                Ok(target) => {
+                    id = Some(OpId::Checkpoint(target));
+                    notify(&mut ctx, Phase::Requesting, None);
+                    match self.handle.remove_checkpoint(target).await {
+                        Err(error) => Err(error),
+                        Ok(pending) => self.finish(found, pending, None, &mut ctx).await,
+                    }
+                }
+            },
+        };
+        OpOutcome {
+            target: checkpoint.to_string(),
+            id,
+            result,
+        }
     }
 
     /// Reads the state of one VM.

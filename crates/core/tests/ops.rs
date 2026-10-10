@@ -309,36 +309,38 @@ async fn checkpoints_are_created_and_removed_by_name() {
     let ops = operations(fixture()).await;
     let vm = ok(ops.resolve_vm("web-02").await);
 
-    let created = ok(ops
+    let created = ops
         .create_checkpoint(
             "web-02",
             Some("before-work"),
             WaitPolicy::Wait(Some(Duration::from_secs(30))),
             &mut no_progress,
         )
-        .await);
-    assert!(matches!(created, OpSuccess::Completed { .. }));
+        .await
+        .result;
+    assert!(matches!(created, Ok(OpSuccess::Completed { .. })));
 
     let listed = ok(ops.handle().list_checkpoints(vm).await);
     let name = listed.first().map(|checkpoint| checkpoint.name.clone());
     assert_eq!(name, Some("before-work".to_string()));
 
-    let removed = ok(ops
+    let removed = ops
         .remove_checkpoint(
             "web-02",
             "before-work",
             WaitPolicy::Wait(Some(Duration::from_secs(30))),
             &mut no_progress,
         )
-        .await);
-    assert!(matches!(removed, OpSuccess::Completed { .. }));
+        .await
+        .result;
+    assert!(matches!(removed, Ok(OpSuccess::Completed { .. })));
     assert!(ok(ops.handle().list_checkpoints(vm).await).is_empty());
 }
 
 #[tokio::test(start_paused = true)]
 async fn restoring_a_running_vm_is_rejected_before_anything_starts() {
     let ops = operations(fixture()).await;
-    let error = ops
+    let outcome = ops
         .restore_checkpoint(
             "web-01",
             "before-upgrade",
@@ -346,7 +348,7 @@ async fn restoring_a_running_vm_is_rejected_before_anything_starts() {
             &mut no_progress,
         )
         .await;
-    match error {
+    match outcome.result {
         Err(HyperVError::InvalidState { state, .. }) => assert_eq!(state, VmState::Running),
         Err(other) => panic!("expected an invalid state, got {other}"),
         Ok(success) => panic!("expected a failure, got {success:?}"),

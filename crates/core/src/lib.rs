@@ -28,7 +28,7 @@ pub use handle::BackendHandle;
 pub use hyper_v::{HyperV, RequestedState};
 pub use ids::{CheckpointId, SwitchId, VmId};
 pub use job::{JobRef, JobStatus, Pending};
-pub use ops::{OpOutcome, OpSuccess, Operations, Phase, Progress, VmOp, WaitPolicy};
+pub use ops::{OpId, OpOutcome, OpSuccess, Operations, Phase, Progress, VmOp, WaitPolicy};
 pub use switch::{SwitchDetail, SwitchKind, SwitchSummary, VlanMode, VlanSettings};
 pub use target::{Candidate, Target, TargetKind};
 pub use vhd::{

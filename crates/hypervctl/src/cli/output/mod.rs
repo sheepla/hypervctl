@@ -6,6 +6,7 @@ pub mod format;
 #[cfg(test)]
 mod golden_tests;
 pub mod json;
+pub mod operations;
 pub mod table;
 pub mod views;
 

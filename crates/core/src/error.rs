@@ -150,6 +150,21 @@ impl HyperVError {
             Self::Backend { raw } => Some(raw),
         }
     }
+
+    /// The classification as a stable, machine-readable name, for result rows
+    /// and the TUI (design 4.4).
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::PermissionDenied { .. } => "permission_denied",
+            Self::HyperVUnavailable { .. } => "hyper_v_unavailable",
+            Self::NotFound { .. } => "not_found",
+            Self::Ambiguous { .. } => "ambiguous",
+            Self::InvalidState { .. } => "invalid_state",
+            Self::Timeout { .. } => "timeout",
+            Self::JobFailed { .. } => "job_failed",
+            Self::Backend { .. } => "backend",
+        }
+    }
 }
 
 #[cfg(test)]

@@ -15,7 +15,7 @@ use hypervctl_backend_mock::MockBackend;
 use hypervctl_core::{BackendActor, Operations};
 
 use crate::cli::args::Cli;
-use crate::cli::commands;
+use crate::cli::commands::{self, Context};
 
 /// Runs one command against the fixture and returns exactly what it writes to
 /// stdout.
@@ -26,6 +26,7 @@ fn render(args: &[&str]) -> String {
         .unwrap_or_else(|error| panic!("the arguments {args:?} must parse: {error}"));
     // Not a terminal, no known width, `NO_COLOR` unset: the flags decide alone.
     let opts = super::build(&cli.global, false, None, true);
+    let context = Context::new(&cli.global, &opts);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -33,9 +34,11 @@ fn render(args: &[&str]) -> String {
     runtime
         .block_on(async {
             let ops = Operations::new(BackendActor::spawn(MockBackend::with_fixture));
-            commands::run(&cli.resource, &ops, &opts).await
+            commands::run(&cli.resource, &ops, &context)
+                .await
+                .map(|output| output.stdout)
         })
-        .unwrap_or_else(|error| panic!("{args:?} must render: {error}"))
+        .unwrap_or_else(|error| panic!("{args:?} must render: {error:?}"))
 }
 
 fn blessed() -> bool {

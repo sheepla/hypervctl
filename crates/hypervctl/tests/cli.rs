@@ -150,9 +150,15 @@ fn a_vhd_that_does_not_exist_is_not_found() {
 
 #[test]
 fn a_usage_mistake_exits_with_two() {
-    let output = run(&["vm", "start", "web-01"]);
-    assert_eq!(status(&output), 2);
-    assert!(stdout(&output).is_empty(), "{}", stdout(&output));
+    // A missing target is a usage mistake.
+    let missing = run(&["vm", "start"]);
+    assert_eq!(status(&missing), 2);
+    assert!(stdout(&missing).is_empty(), "{}", stdout(&missing));
+
+    // The two waiting flags cannot both be given (spec 2.7).
+    let both = run(&["vm", "start", "web-01", "--no-wait", "--timeout", "5"]);
+    assert_eq!(status(&both), 2);
+    assert!(stdout(&both).is_empty(), "{}", stdout(&both));
 }
 
 #[test]
@@ -225,4 +231,180 @@ fn an_unknown_backend_value_is_reported() {
         err.contains("unknown HYPERVCTL_BACKEND value: kvm"),
         "{err:?}"
     );
+}
+
+// --- M5: operations (spec 2.3, 2.4, 2.6 to 2.11) ---
+
+#[test]
+fn an_operation_that_is_already_true_reports_itself_and_succeeds() {
+    let started = run(&["vm", "start", "web-01"]);
+    assert_eq!(status(&started), 0, "{}", stderr(&started));
+    assert!(stdout(&started).is_empty(), "{}", stdout(&started));
+    assert!(
+        stderr(&started).contains("web-01: already running"),
+        "{:?}",
+        stderr(&started)
+    );
+
+    let stopped = run(&["vm", "stop", "web-02"]);
+    assert_eq!(status(&stopped), 0, "{}", stderr(&stopped));
+    assert!(
+        stderr(&stopped).contains("web-02: already stopped"),
+        "{:?}",
+        stderr(&stopped)
+    );
+
+    let saved = run(&["vm", "save", "db-01"]);
+    assert_eq!(status(&saved), 0, "{}", stderr(&saved));
+    assert!(
+        stderr(&saved).contains("db-01: already saved"),
+        "{:?}",
+        stderr(&saved)
+    );
+}
+
+#[test]
+fn an_operation_reaches_its_goal_and_says_so() {
+    let output = run(&["vm", "start", "web-02"]);
+    assert_eq!(status(&output), 0, "{}", stderr(&output));
+    assert!(stdout(&output).is_empty(), "{}", stdout(&output));
+    assert!(
+        stderr(&output).contains("web-02: started"),
+        "{:?}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn one_failure_among_several_targets_exits_with_one() {
+    let output = run(&["vm", "start", "web-01", "nope"]);
+    assert_eq!(status(&output), 1);
+    assert!(stdout(&output).is_empty(), "{}", stdout(&output));
+    let err = stderr(&output);
+    assert!(err.contains("web-01: already running"), "{err:?}");
+    assert!(err.contains("error: nope: VM not found: 'nope'"), "{err:?}");
+}
+
+#[test]
+fn an_unknown_target_of_an_operation_is_not_found_and_exits_with_three() {
+    let output = run(&["vm", "start", "nope"]);
+    assert_eq!(status(&output), 3);
+    assert!(stdout(&output).is_empty(), "{}", stdout(&output));
+    let err = stderr(&output);
+    assert!(err.contains("error: VM not found: 'nope'"), "{err:?}");
+}
+
+#[test]
+fn a_destructive_verb_needs_a_terminal_or_the_yes_flag() {
+    let output = run(&["vm", "stop", "--force", "web-01"]);
+    assert_eq!(status(&output), 2);
+    assert!(stdout(&output).is_empty(), "{}", stdout(&output));
+    let err = stderr(&output);
+    assert!(err.contains("error:"), "{err:?}");
+    assert!(err.contains("-y"), "{err:?}");
+}
+
+#[test]
+fn the_yes_flag_lets_a_destructive_verb_through() {
+    let output = run(&["-y", "vm", "stop", "--force", "web-01"]);
+    assert_eq!(status(&output), 0, "{}", stderr(&output));
+    assert!(stdout(&output).is_empty(), "{}", stdout(&output));
+    assert!(
+        stderr(&output).contains("web-01: stopped"),
+        "{:?}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn no_wait_submits_and_says_so() {
+    let output = run(&["vm", "start", "web-02", "--no-wait"]);
+    assert_eq!(status(&output), 0, "{}", stderr(&output));
+    assert!(stdout(&output).is_empty(), "{}", stdout(&output));
+    assert!(
+        stderr(&output).contains("web-02: submitted"),
+        "{:?}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn operation_rows_come_out_as_json_and_csv() {
+    let json = run(&["-o", "json", "vm", "start", "web-02"]);
+    assert_eq!(status(&json), 0, "{}", stderr(&json));
+    let parsed: serde_json::Value = serde_json::from_str(&stdout(&json))
+        .unwrap_or_else(|error| panic!("the JSON must parse: {error}"));
+    assert_eq!(parsed[0]["name"], "web-02");
+    assert_eq!(parsed[0]["status"], "succeeded");
+    assert_eq!(parsed[0]["id"], "00000002-0000-0000-0000-000000000000");
+    assert!(parsed[0]["error"].is_null(), "{parsed:?}");
+    assert!(
+        !stderr(&json).contains(": started"),
+        "result lines belong to a terminal, not to a machine-readable stream: {:?}",
+        stderr(&json)
+    );
+
+    let csv = run(&["-o", "csv", "vm", "start", "web-02"]);
+    assert_eq!(status(&csv), 0, "{}", stderr(&csv));
+    let text = String::from_utf8_lossy(&csv.stdout).into_owned();
+    assert!(text.starts_with("id,name,status"), "{text:?}");
+    assert!(
+        text.contains("00000002-0000-0000-0000-000000000000,web-02,succeeded"),
+        "{text:?}"
+    );
+    assert!(!stderr(&csv).contains(": started"), "{:?}", stderr(&csv));
+}
+
+#[test]
+fn a_checkpoint_operation_shows_the_checkpoint_it_acted_on() {
+    let output = run(&["-y", "checkpoint", "remove", "web-01", "nightly"]);
+    assert_eq!(status(&output), 0, "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("nightly: removed"),
+        "{:?}",
+        stderr(&output)
+    );
+
+    let json = run(&[
+        "-y",
+        "-o",
+        "json",
+        "checkpoint",
+        "remove",
+        "web-01",
+        "nightly",
+    ]);
+    assert_eq!(status(&json), 0, "{}", stderr(&json));
+    let parsed: serde_json::Value = serde_json::from_str(&stdout(&json))
+        .unwrap_or_else(|error| panic!("the JSON must parse: {error}"));
+    assert_eq!(parsed[0]["name"], "nightly");
+    assert_eq!(parsed[0]["status"], "succeeded");
+    assert_eq!(parsed[0]["id"], "00000101-0000-0000-0000-000000000000");
+}
+
+#[test]
+fn a_checkpoint_of_a_running_vm_cannot_be_restored() {
+    let output = run(&["-y", "checkpoint", "restore", "web-01", "before-upgrade"]);
+    assert_eq!(status(&output), 1);
+    assert!(stdout(&output).is_empty(), "{}", stdout(&output));
+    let err = stderr(&output);
+    assert!(err.contains("error:"), "{err:?}");
+    assert!(err.contains("not valid in state Running"), "{err:?}");
+}
+
+#[test]
+fn an_unknown_checkpoint_is_not_found_and_exits_with_three() {
+    let output = run(&["-y", "checkpoint", "restore", "web-01", "nope"]);
+    assert_eq!(status(&output), 3);
+    let err = stderr(&output);
+    assert!(err.contains("error:"), "{err:?}");
+}
+
+#[test]
+fn an_operation_verb_still_takes_the_global_options_after_itself() {
+    let output = run(&["vm", "start", "web-02", "-o", "json"]);
+    assert_eq!(status(&output), 0, "{}", stderr(&output));
+    let parsed: serde_json::Value = serde_json::from_str(&stdout(&output))
+        .unwrap_or_else(|error| panic!("the JSON must parse: {error}"));
+    assert_eq!(parsed[0]["status"], "succeeded");
 }
