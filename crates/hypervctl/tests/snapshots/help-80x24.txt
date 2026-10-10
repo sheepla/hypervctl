@@ -1,0 +1,24 @@
+┌VMs───────────────────────────────────────────────────────────────────────────┐
+│> db-01      ┌Help──────────────────────────────────────────────┐    -  -     │
+│  ghost      │Keys of the focused pane                          │    -  -     │
+│  web-01     │                                                  │    -  -     │
+│  web-02     │q/Ctrl+C quit                                     │    -  -     │
+│             │Tab focus                                         │             │
+│             │r refresh                                         │             │
+│             │Space menu                                        │             │
+│             │? help                                            │             │
+│             │1 details tab                                     │             │
+└─────────────│2 checkpoints tab                                 │─────────────┘
+┌─────────────│j/Down move                                       │─────────────┐
+│ 1 Details │ │k/Up move                                         │             │
+│Name         │g first                                           │             │
+│Id           │G last                                            │             │
+│State        │Enter detail pane                                 │             │
+│Generation   │                                                  │             │
+│CPU          │Keys of the menu                                  │             │
+│Uptime       │                                                  │             │
+│Processors   │j/Down move                                       │             │
+│Startup memor│k/Up move                                         │             │
+│Dynamic memor│Enter run                                         │             │
+└─────────────└──────────────────────────────────────────────────┘─────────────┘
+? close  Esc close  q/Ctrl+C quit

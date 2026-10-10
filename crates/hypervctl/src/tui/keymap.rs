@@ -11,6 +11,9 @@ use crate::tui::store::{Action, DetailTab};
 pub enum Context {
     List,
     Detail,
+    Menu,
+    Confirm,
+    Help,
 }
 
 const NONE: KeyModifiers = KeyModifiers::empty();
@@ -28,11 +31,10 @@ struct Binding {
 const LIST: &[Context] = &[Context::List];
 const DETAIL: &[Context] = &[Context::Detail];
 const BOTH: &[Context] = &[Context::List, Context::Detail];
+const MENU: &[Context] = &[Context::Menu];
+const HELP: &[Context] = &[Context::Help];
 
 /// The whole keymap of the TUI, in the order the status bar shows the hints.
-///
-/// The keys of the menu, the confirmation dialog and the help belong here once
-/// those exist (M9).
 const BINDINGS: &[Binding] = &[
     Binding {
         contexts: BOTH,
@@ -51,6 +53,18 @@ const BINDINGS: &[Binding] = &[
         keys: &[(KeyCode::Char('r'), NONE)],
         action: Action::RefreshNow,
         description: "refresh",
+    },
+    Binding {
+        contexts: BOTH,
+        keys: &[(KeyCode::Char(' '), NONE)],
+        action: Action::OpenMenu,
+        description: "menu",
+    },
+    Binding {
+        contexts: BOTH,
+        keys: &[(KeyCode::Char('?'), NONE)],
+        action: Action::ToggleHelp,
+        description: "help",
     },
     Binding {
         contexts: BOTH,
@@ -124,6 +138,56 @@ const BINDINGS: &[Binding] = &[
         action: Action::FocusList,
         description: "back to list",
     },
+    Binding {
+        contexts: MENU,
+        keys: &[(KeyCode::Char('j'), NONE), (KeyCode::Down, NONE)],
+        action: Action::MenuDown,
+        description: "move",
+    },
+    Binding {
+        contexts: MENU,
+        keys: &[(KeyCode::Char('k'), NONE), (KeyCode::Up, NONE)],
+        action: Action::MenuUp,
+        description: "move",
+    },
+    Binding {
+        contexts: MENU,
+        keys: &[(KeyCode::Enter, NONE)],
+        action: Action::MenuSelect,
+        description: "run",
+    },
+    Binding {
+        contexts: MENU,
+        keys: &[(KeyCode::Esc, NONE)],
+        action: Action::CloseOverlay,
+        description: "close",
+    },
+    // The dialog runs on `y` alone and cancels on every other key, which the
+    // resolver handles before the table (spec 3.4).
+    Binding {
+        contexts: &[Context::Confirm],
+        keys: &[(KeyCode::Char('y'), NONE)],
+        action: Action::ConfirmYes,
+        description: "confirm",
+    },
+    Binding {
+        contexts: HELP,
+        keys: &[(KeyCode::Char('?'), NONE)],
+        action: Action::ToggleHelp,
+        description: "close",
+    },
+    Binding {
+        contexts: HELP,
+        keys: &[(KeyCode::Esc, NONE)],
+        action: Action::CloseOverlay,
+        description: "close",
+    },
+    Binding {
+        contexts: HELP,
+        keys: &[(KeyCode::Char('q'), NONE), (KeyCode::Char('c'), CONTROL)],
+        action: Action::Quit,
+        description: "quit",
+    },
 ];
 
 /// The action a key asks for in `context`, or nothing.
@@ -133,6 +197,15 @@ const BINDINGS: &[Binding] = &[
 pub fn action(context: Context, key: KeyEvent) -> Option<Action> {
     if key.kind != KeyEventKind::Press {
         return None;
+    }
+    // The confirmation dialog runs on `y` and cancels on every other key,
+    // which no table can say (spec 3.4).
+    if context == Context::Confirm {
+        return if matches(&key, KeyCode::Char('y'), NONE) {
+            Some(Action::ConfirmYes)
+        } else {
+            Some(Action::ConfirmCancel)
+        };
     }
     BINDINGS
         .iter()
@@ -146,7 +219,8 @@ pub fn action(context: Context, key: KeyEvent) -> Option<Action> {
         .map(|binding| binding.action.clone())
 }
 
-/// The key hints of `context`, in the order of the table (design 5.8).
+/// The key hints of `context`, in the order of the table (design 5.8). The
+/// help overlay prints the very same lists (M9 acceptance).
 pub fn hints(context: Context) -> Vec<String> {
     BINDINGS
         .iter()
@@ -165,8 +239,11 @@ pub fn hints(context: Context) -> Vec<String> {
 fn key_name(code: KeyCode, modifiers: KeyModifiers) -> &'static str {
     match (code, modifiers) {
         (KeyCode::Char('c'), CONTROL) => "Ctrl+C",
+        (KeyCode::Char(' '), NONE) => "Space",
+        (KeyCode::Char('?'), NONE) => "?",
         (KeyCode::Char('q'), _) => "q",
         (KeyCode::Char('r'), _) => "r",
+        (KeyCode::Char('y'), _) => "y",
         (KeyCode::Char('1'), _) => "1",
         (KeyCode::Char('2'), _) => "2",
         (KeyCode::Char('j'), _) => "j",
@@ -345,5 +422,83 @@ mod tests {
             !detail.iter().any(|hint| hint.contains("first")),
             "{detail:?}"
         );
+    }
+
+    #[test]
+    fn space_opens_the_menu_and_question_mark_toggles_help() {
+        for context in [Context::List, Context::Detail] {
+            assert_eq!(
+                action(context, press(KeyCode::Char(' '))),
+                Some(Action::OpenMenu)
+            );
+            assert_eq!(
+                action(context, press(KeyCode::Char('?'))),
+                Some(Action::ToggleHelp)
+            );
+        }
+    }
+
+    #[test]
+    fn the_menu_keys_move_and_select() {
+        assert_eq!(
+            action(Context::Menu, press(KeyCode::Char('j'))),
+            Some(Action::MenuDown)
+        );
+        assert_eq!(
+            action(Context::Menu, press(KeyCode::Char('k'))),
+            Some(Action::MenuUp)
+        );
+        assert_eq!(
+            action(Context::Menu, press(KeyCode::Enter)),
+            Some(Action::MenuSelect)
+        );
+        assert_eq!(
+            action(Context::Menu, press(KeyCode::Esc)),
+            Some(Action::CloseOverlay)
+        );
+    }
+
+    #[test]
+    fn the_dialog_runs_on_y_and_cancels_on_any_other_key() {
+        assert_eq!(
+            action(Context::Confirm, press(KeyCode::Char('y'))),
+            Some(Action::ConfirmYes)
+        );
+        for cancel in [
+            KeyCode::Enter,
+            KeyCode::Esc,
+            KeyCode::Char('n'),
+            KeyCode::Char('q'),
+            KeyCode::Char(' '),
+        ] {
+            assert_eq!(
+                action(Context::Confirm, press(cancel)),
+                Some(Action::ConfirmCancel),
+                "{cancel:?} must cancel"
+            );
+        }
+    }
+
+    #[test]
+    fn the_help_keys_are_generated_from_the_table() {
+        assert_eq!(
+            action(Context::Help, press(KeyCode::Char('?'))),
+            Some(Action::ToggleHelp)
+        );
+        assert_eq!(
+            action(Context::Help, press(KeyCode::Esc)),
+            Some(Action::CloseOverlay)
+        );
+        let menu = hints(Context::Menu);
+        assert!(
+            menu.contains(&"Space menu".to_string()) || menu.contains(&"Enter run".to_string()),
+            "{menu:?}"
+        );
+        let list = hints(Context::List);
+        assert!(
+            list.iter().any(|hint| hint.starts_with("Space ")),
+            "{list:?}"
+        );
+        assert!(list.iter().any(|hint| hint.starts_with("? ")), "{list:?}");
     }
 }

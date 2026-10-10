@@ -4,7 +4,7 @@
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph, Tabs};
+use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Tabs};
 use ratatui::Frame;
 
 use crate::cli::args::Format;
@@ -24,24 +24,43 @@ pub fn render(frame: &mut Frame, area: Rect, state: &State) {
         .select(state.detail.tab.index())
         .highlight_style(Style::new().reversed());
     frame.render_widget(tabs, tabs_area);
-    frame.render_widget(
-        Paragraph::new(body(state)).scroll((state.detail.scroll, 0)),
-        body_area,
-    );
+    match state.detail.tab {
+        DetailTab::Checkpoints => render_checkpoints(frame, body_area, state),
+        DetailTab::Details => frame.render_widget(
+            Paragraph::new(body(state)).scroll((state.detail.scroll, 0)),
+            body_area,
+        ),
+    }
 }
 
-/// The lines under the tab bar.
+/// The lines under the tab bar on the Details tab.
 fn body(state: &State) -> Vec<Line<'static>> {
     if state.vm_list.items.is_empty() {
         return vec![Line::raw("No VMs")];
     }
-    match state.detail.tab {
-        DetailTab::Checkpoints => Vec::new(),
-        DetailTab::Details => match &state.detail.detail {
-            Some(detail) => detail_lines(detail),
-            None => vec![Line::raw("Loading...")],
-        },
+    match &state.detail.detail {
+        Some(detail) => detail_lines(detail),
+        None => vec![Line::raw("Loading...")],
     }
+}
+
+/// The checkpoints of the selected VM as a list (spec 3.2).
+fn render_checkpoints(frame: &mut Frame, area: Rect, state: &State) {
+    let checkpoints = &state.detail.checkpoints;
+    let items: Vec<ListItem> = if checkpoints.in_flight && checkpoints.items.is_empty() {
+        vec![ListItem::new(Line::raw("Loading..."))]
+    } else if checkpoints.items.is_empty() {
+        vec![ListItem::new(Line::raw("No checkpoints"))]
+    } else {
+        checkpoints
+            .items
+            .iter()
+            .map(|entry| ListItem::new(Line::raw(entry.name.clone())))
+            .collect()
+    };
+    let list = List::new(items).highlight_style(Style::new().reversed());
+    let mut list_state = ListState::default().with_selected(checkpoints.selected_index());
+    frame.render_stateful_widget(list, area, &mut list_state);
 }
 
 /// The fields of `vm get`, rendered from the very rows the CLI prints.

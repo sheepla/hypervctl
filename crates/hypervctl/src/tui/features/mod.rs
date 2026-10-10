@@ -2,5 +2,7 @@
 //! changes it (design 5.1 and 5.9).
 
 pub mod detail;
+pub mod help;
+pub mod menu;
 pub mod status_bar;
 pub mod vm_list;

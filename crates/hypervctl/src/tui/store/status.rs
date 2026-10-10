@@ -37,6 +37,16 @@ impl StatusState {
         });
     }
 
+    /// Replaces the current message with one that disappears by itself: a
+    /// success fades after a few seconds (spec 3.5).
+    pub fn show_timed(&mut self, kind: StatusKind, text: impl Into<String>, deadline: Instant) {
+        self.current = Some(StatusMessage {
+            kind,
+            text: text.into(),
+            deadline: Some(deadline),
+        });
+    }
+
     /// Drops the message once its deadline has passed (the `UiTick` calls this).
     pub fn expire(&mut self, now: Instant) {
         if self

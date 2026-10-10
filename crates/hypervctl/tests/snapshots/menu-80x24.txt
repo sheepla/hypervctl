@@ -1,0 +1,24 @@
+┌VMs───────────────────────────────────────────────────────────────────────────┐
+│> db-01                                   Saved            -         -  -     │
+│  ghost                                   Unknown(42)      -         -  -     │
+│  web-01                                  Running          -         -  -     │
+│  web-02                                  Off              -         -  -     │
+│                                                                              │
+│                                                                              │
+│               ┌Actions — db-01───────────────────────────────┐               │
+│               │Start                                         │               │
+│               │Stop                                          │               │
+└───────────────│Stop (force)                                  │───────────────┘
+┌───────────────│Restart                                       │───────────────┐
+│ 1 Details │ 2 │Restart (force)                               │               │
+│Name           │Save                                          │               │
+│Id             │Pause                                         │               │
+│State          │Resume                                        │               │
+│Generation     │Create checkpoint                             │               │
+│CPU            └──────────────────────────────────────────────┘               │
+│Uptime              -                                                         │
+│Processors          2                                                         │
+│Startup memory      2.0 GB                                                    │
+│Dynamic memory      enabled                                                   │
+└──────────────────────────────────────────────────────────────────────────────┘
+j/Down move  k/Up move  Enter run  Esc close

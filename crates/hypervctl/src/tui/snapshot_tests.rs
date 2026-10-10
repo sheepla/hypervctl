@@ -124,3 +124,48 @@ fn a_terminal_below_the_minimum_gets_one_notice() {
     let state = sample_state(40, 10);
     compare("too-small-40x10", &frame(&state, 40, 10));
 }
+
+#[test]
+fn the_action_menu_covers_the_panes() {
+    let mut state = sample_state(80, 24);
+    let _ = crate::tui::store::reduce(&mut state, crate::tui::store::Action::OpenMenu);
+    compare("menu-80x24", &frame(&state, 80, 24));
+}
+
+#[test]
+fn the_confirmation_dialog_covers_the_panes() {
+    let mut state = sample_state(80, 24);
+    let _ = crate::tui::store::reduce(&mut state, crate::tui::store::Action::OpenMenu);
+    let _ = crate::tui::store::reduce(&mut state, crate::tui::store::Action::MenuDown);
+    let _ = crate::tui::store::reduce(&mut state, crate::tui::store::Action::MenuSelect);
+    compare("confirm-80x24", &frame(&state, 80, 24));
+}
+
+#[test]
+fn the_help_covers_the_panes() {
+    let mut state = sample_state(80, 24);
+    let _ = crate::tui::store::reduce(&mut state, crate::tui::store::Action::ToggleHelp);
+    compare("help-80x24", &frame(&state, 80, 24));
+}
+
+#[test]
+fn the_checkpoints_tab_of_a_vm_without_checkpoints() {
+    let mut state = sample_state(80, 24);
+    let _ = crate::tui::store::reduce(
+        &mut state,
+        crate::tui::store::Action::SelectTab(crate::tui::store::DetailTab::Checkpoints),
+    );
+    // Pretend the fetch already answered with nothing.
+    state.detail.checkpoints.in_flight = false;
+    compare("checkpoints-empty-80x24", &frame(&state, 80, 24));
+}
+
+#[test]
+fn a_vm_with_an_operation_shows_a_spinner() {
+    let mut state = sample_state(80, 24);
+    let selected = state.vm_list.selected;
+    if let Some(id) = selected {
+        state.ops.start(id, "stopping".to_string());
+    }
+    compare("spinner-80x24", &frame(&state, 80, 24));
+}

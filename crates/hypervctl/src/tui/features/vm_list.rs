@@ -18,6 +18,9 @@ use crate::tui::store::State;
 /// and the CPU, memory and uptime columns, with their gaps.
 const RIGHT_OF_NAME: u16 = 2 + 11 + 2 + 5 + 2 + 8 + 2 + 8;
 
+/// The four spinner frames (spec 3.5).
+const SPINNER: [&str; 4] = ["|", "/", "-", "\\"];
+
 /// Renders the list into `area`, scrolling so that the selection stays visible.
 pub fn render(frame: &mut Frame, area: Rect, state: &State) {
     let name_width = usize::from(area.width.saturating_sub(RIGHT_OF_NAME + 2).max(1));
@@ -25,7 +28,10 @@ pub fn render(frame: &mut Frame, area: Rect, state: &State) {
         .vm_list
         .items
         .iter()
-        .map(|vm| ListItem::new(line(vm, name_width)))
+        .map(|vm| {
+            let busy = state.ops.label(vm.id).map(str::to_string);
+            ListItem::new(line(vm, name_width, busy.as_deref(), state.ui.spinner))
+        })
         .collect();
     let list = List::new(items)
         .block(Block::bordered().title("VMs"))
@@ -35,14 +41,26 @@ pub fn render(frame: &mut Frame, area: Rect, state: &State) {
     frame.render_stateful_widget(list, area, &mut list_state);
 }
 
-/// One row: name, state, CPU, memory and uptime, in that order (spec 3.2).
-fn line(vm: &VmSummary, name_width: usize) -> ratatui::text::Line<'static> {
+/// One row: name, state, CPU, memory and uptime, in that order (spec 3.2). A
+/// VM with an operation in flight replaces the CPU cell with a spinner (spec 3.5).
+fn line(
+    vm: &VmSummary,
+    name_width: usize,
+    op_label: Option<&str>,
+    spinner: usize,
+) -> ratatui::text::Line<'static> {
     let name = truncate(&vm.name, name_width);
     let pad = " ".repeat(name_width.saturating_sub(width(&name)));
     let state = state_label(vm.state);
-    let cpu = match vm.cpu_usage_percent {
-        Some(value) => format!("{:>5}", format::percent(value)),
-        None => "    -".to_string(),
+    let cpu = match op_label {
+        Some(label) => {
+            let frame = SPINNER[spinner % SPINNER.len()];
+            format!("{frame} {label}")
+        }
+        None => match vm.cpu_usage_percent {
+            Some(value) => format!("{:>5}", format::percent(value)),
+            None => "    -".to_string(),
+        },
     };
     let memory = match vm.memory_assigned_bytes {
         Some(value) => format!("{:>8}", format::size(value)),

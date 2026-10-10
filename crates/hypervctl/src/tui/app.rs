@@ -22,6 +22,7 @@ const UI_TICK: Duration = Duration::from_millis(100);
 
 /// Everything the loop needs that outlives one action.
 struct Loop {
+    ops: Operations,
     handle: BackendHandle,
     actions: mpsc::UnboundedSender<Action>,
 }
@@ -55,6 +56,7 @@ pub async fn run(ops: &Operations, refresh: Duration) -> Result<CommandOutput, C
     ui_timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     let looping = Loop {
+        ops: ops.clone(),
         handle: ops.handle().clone(),
         actions,
     };
@@ -62,7 +64,12 @@ pub async fn run(ops: &Operations, refresh: Duration) -> Result<CommandOutput, C
     // The first list already selected a VM, but nothing has asked for its
     // detail yet (design 5.10).
     if let Some(id) = state.vm_list.selected {
-        effects::spawn(Effect::FetchVmDetail(id), &looping.handle, &looping.actions);
+        effects::spawn(
+            Effect::FetchVmDetail(id),
+            &looping.ops,
+            &looping.handle,
+            &looping.actions,
+        );
     }
 
     // Step 6: wait for one event, apply it and everything else that piled up,
@@ -96,11 +103,18 @@ pub async fn run(ops: &Operations, refresh: Duration) -> Result<CommandOutput, C
                 }
             }
             maybe = change_rx.recv() => {
-                // The checkpoint notifications get their own action in M9.
-                if let Some(ChangeEvent::Vms) = maybe {
-                    if !step(&mut state, Action::BackendChanged, &looping) {
+                match maybe {
+                    Some(ChangeEvent::Vms) => {
+                        if !step(&mut state, Action::BackendChanged, &looping) {
+                            break;
+                        }
+                    }
+                    Some(ChangeEvent::Checkpoints(vm))
+                        if !step(&mut state, Action::CheckpointsChanged(vm), &looping) =>
+                    {
                         break;
                     }
+                    Some(ChangeEvent::Checkpoints(_)) | None => {}
                 }
             }
             _ = refresh_timer.tick() => {
@@ -141,7 +155,7 @@ fn step(state: &mut State, action: Action, looping: &Loop) -> bool {
     for effect in store::reduce(state, action) {
         match effect {
             Effect::Quit => return false,
-            other => effects::spawn(other, &looping.handle, &looping.actions),
+            other => effects::spawn(other, &looping.ops, &looping.handle, &looping.actions),
         }
     }
     true

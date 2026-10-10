@@ -2,21 +2,33 @@
 //! and 5.3). State belongs to the main loop alone; `reduce` does no I/O, takes
 //! no clock and returns the effects the runner has to perform.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crossterm::event::KeyEvent;
-use hypervctl_core::{HyperVError, VmDetail, VmId, VmSummary};
+use hypervctl_core::{Checkpoint, HyperVError, VmDetail, VmId, VmState, VmSummary};
 
 pub mod detail;
+pub mod menu;
+pub mod ops_state;
+pub mod overlay;
 pub mod status;
 pub mod vm_list;
 
 use detail::DetailState;
 pub use detail::DetailTab;
+use menu::{
+    checkpoint_confirm_question, vm_confirm_question, vm_item_enabled, CheckpointMenuItem,
+    VmMenuItem, CHECKPOINT_MENU, VM_MENU,
+};
+use ops_state::OpsState;
+pub use overlay::{ConfirmState, MenuKind, MenuState, OpRequest, Overlay};
 use status::{StatusKind, StatusState};
 use vm_list::VmListState;
 
 use crate::tui::keymap;
+
+/// How long a success stays on the status bar before it fades (spec 3.5).
+const SUCCESS_LIFETIME: Duration = Duration::from_secs(3);
 
 /// Which pane has the keyboard (spec 3.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +42,8 @@ pub enum Focus {
 pub struct UiState {
     pub width: u16,
     pub height: u16,
+    /// Which spinner frame the operations in flight show (spec 3.5).
+    pub spinner: usize,
 }
 
 impl UiState {
@@ -42,12 +56,22 @@ impl UiState {
     }
 }
 
+/// A failed operation, with the classification kept so that a stopped backend
+/// stays fatal (design 5.5).
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpFailure {
+    pub message: String,
+    pub error: HyperVError,
+}
+
 /// Everything the TUI knows (design 5.3).
 #[derive(Debug)]
 pub struct State {
     pub vm_list: VmListState,
     pub focus: Focus,
     pub detail: DetailState,
+    pub ops: OpsState,
+    pub overlay: Overlay,
     pub status: StatusState,
     pub ui: UiState,
     /// The backend actor stopped: the loop ends and the exit code is 1
@@ -74,33 +98,49 @@ impl State {
                 tab: DetailTab::Details,
                 for_vm: None,
                 detail: None,
+                checkpoints: detail::CheckpointsState::default(),
                 scroll: 0,
             },
+            ops: OpsState::default(),
+            overlay: Overlay::None,
             status: StatusState::default(),
-            ui: UiState { width, height },
+            ui: UiState {
+                width,
+                height,
+                spinner: 0,
+            },
             fatal: None,
         }
     }
 
-    /// Which keymap table the keys are looked up in right now (spec 3.3).
+    /// Which keymap table the keys are looked up in right now (spec 3.3). A
+    /// popup outranks the panes.
     pub fn keymap_context(&self) -> keymap::Context {
-        match self.focus {
-            Focus::List => keymap::Context::List,
-            Focus::Detail => keymap::Context::Detail,
+        match self.overlay {
+            Overlay::Menu(_) => keymap::Context::Menu,
+            Overlay::Confirm(_) => keymap::Context::Confirm,
+            Overlay::Help => keymap::Context::Help,
+            Overlay::None => match self.focus {
+                Focus::List => keymap::Context::List,
+                Focus::Detail => keymap::Context::Detail,
+            },
         }
     }
 
-    /// Whether the `UiTick` has to run: only while something expires (design 5.2).
+    /// Whether the `UiTick` has to run: while a message expires or an
+    /// operation spins (design 5.2, spec 3.5).
     pub fn needs_ui_tick(&self) -> bool {
-        self.status.needs_tick()
+        self.status.needs_tick() || !self.ops.is_empty()
     }
 }
 
 /// What the runner has to do for the reducer (design 5.4).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Effect {
     FetchVmList,
     FetchVmDetail(VmId),
+    FetchCheckpoints(VmId),
+    RunOperation(OpRequest),
     Quit,
 }
 
@@ -122,18 +162,36 @@ pub enum Action {
     ScrollUp,
     ScrollDown,
     RefreshNow,
-    // From the terminal and the timers.
+    OpenMenu,
+    MenuUp,
+    MenuDown,
+    MenuSelect,
+    ConfirmYes,
+    ConfirmCancel,
+    ToggleHelp,
+    CloseOverlay,
+    // From the terminal, the timers and the change notifications.
     Input(KeyEvent),
     Resize(u16, u16),
     RefreshTick,
     UiTick(Instant),
     BackendChanged,
+    CheckpointsChanged(VmId),
     // The results of the effects. The payloads are boxed so that the action
     // itself stays small enough to shuffle around the loop.
     VmListLoaded(Box<Result<Vec<VmSummary>, HyperVError>>),
     VmDetailLoaded {
         id: VmId,
         result: Box<Result<VmDetail, HyperVError>>,
+    },
+    CheckpointsLoaded {
+        vm: VmId,
+        result: Box<Result<Vec<Checkpoint>, HyperVError>>,
+    },
+    OpFinished {
+        vm: VmId,
+        result: Result<String, OpFailure>,
+        at: Instant,
     },
 }
 
@@ -166,12 +224,62 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
             state.vm_list.select_last();
             follow_selection(state, &mut effects);
         }
-        Action::SelectTab(tab) => state.detail.tab = tab,
-        Action::TabNext => state.detail.tab = state.detail.tab.next(),
-        Action::TabPrev => state.detail.tab = state.detail.tab.previous(),
-        Action::ScrollDown => state.detail.scroll = state.detail.scroll.saturating_add(1),
-        Action::ScrollUp => state.detail.scroll = state.detail.scroll.saturating_sub(1),
+        Action::SelectTab(tab) => {
+            state.detail.tab = tab;
+            if tab == DetailTab::Checkpoints {
+                request_checkpoints(state, &mut effects);
+            }
+        }
+        Action::TabNext => {
+            state.detail.tab = state.detail.tab.next();
+            if state.detail.tab == DetailTab::Checkpoints {
+                request_checkpoints(state, &mut effects);
+            }
+        }
+        Action::TabPrev => {
+            state.detail.tab = state.detail.tab.previous();
+            if state.detail.tab == DetailTab::Checkpoints {
+                request_checkpoints(state, &mut effects);
+            }
+        }
+        Action::ScrollDown => {
+            if state.focus == Focus::Detail && state.detail.tab == DetailTab::Checkpoints {
+                state.detail.checkpoints.move_by(1);
+            } else {
+                state.detail.scroll = state.detail.scroll.saturating_add(1);
+            }
+        }
+        Action::ScrollUp => {
+            if state.focus == Focus::Detail && state.detail.tab == DetailTab::Checkpoints {
+                state.detail.checkpoints.move_by(-1);
+            } else {
+                state.detail.scroll = state.detail.scroll.saturating_sub(1);
+            }
+        }
         Action::RefreshNow => request_list_now(state, &mut effects),
+        Action::OpenMenu => open_menu(state),
+        Action::MenuUp => menu_move(state, -1),
+        Action::MenuDown => menu_move(state, 1),
+        Action::MenuSelect => menu_select(state, &mut effects),
+        Action::ConfirmYes => confirm_yes(state, &mut effects),
+        Action::ConfirmCancel => {
+            if matches!(state.overlay, Overlay::Confirm(_)) {
+                state.overlay = Overlay::None;
+            }
+        }
+        Action::ToggleHelp => {
+            state.overlay = match &state.overlay {
+                Overlay::Help => Overlay::None,
+                Overlay::None => Overlay::Help,
+                // A menu or a dialog in front keeps its place (spec 3.3).
+                other => other.clone(),
+            };
+        }
+        Action::CloseOverlay => {
+            if !matches!(state.overlay, Overlay::None) {
+                state.overlay = Overlay::None;
+            }
+        }
         // A raw key reaches the keymap here, so the mapping stays a pure table
         // lookup and only presses ever become actions (design 5.8, acceptance 12).
         Action::Input(key) => {
@@ -190,23 +298,49 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
                 start_list_fetch(state, &mut effects);
             }
         }
-        Action::UiTick(now) => state.status.expire(now),
+        Action::UiTick(now) => {
+            state.status.expire(now);
+            state.ui.spinner = (state.ui.spinner + 1) % 4;
+        }
         Action::BackendChanged => request_list_now(state, &mut effects),
+        Action::CheckpointsChanged(vm) => {
+            // The checkpoints of the VM on screen were announced as changed
+            // (spec 3.7); everything else waits for the tab.
+            if state.detail.tab == DetailTab::Checkpoints && state.vm_list.selected == Some(vm) {
+                request_checkpoints(state, &mut effects);
+            }
+        }
         Action::VmListLoaded(result) => {
             state.vm_list.refresh_in_flight = false;
             match *result {
                 Ok(items) => {
-                    if let Some(name) = state.vm_list.apply(items) {
+                    // The name has to be read before the list is replaced, or a
+                    // vanished popup target cannot be told apart from an unknown
+                    // one (design 5.6).
+                    let overlay_target = state.overlay.target();
+                    let overlay_name =
+                        overlay_target.and_then(|target| state.vm_list.name_of(target));
+                    let selection_vanished = state.vm_list.apply(items);
+                    if let Some(name) = &selection_vanished {
                         state.status.show(
                             StatusKind::Info,
                             format!("VM '{name}' is no longer available"),
                         );
                     }
+                    close_overlay_of_a_vanished_vm(
+                        state,
+                        overlay_target,
+                        overlay_name,
+                        &selection_vanished,
+                    );
                     // The selection may have changed, and every list update
                     // re-reads the selected VM's detail (design 5.5).
                     state.detail.follow(state.vm_list.selected);
                     if let Some(id) = state.vm_list.selected {
                         effects.push(Effect::FetchVmDetail(id));
+                    }
+                    if state.detail.tab == DetailTab::Checkpoints {
+                        request_checkpoints(state, &mut effects);
                     }
                 }
                 Err(error) if error.is_backend_stopped() => state.fatal = Some(error),
@@ -229,6 +363,44 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
                 Err(error) if error.is_backend_stopped() => state.fatal = Some(error),
                 Err(error) => state.status.show(StatusKind::Error, error.to_string()),
             }
+        }
+        Action::CheckpointsLoaded { vm, result } => {
+            state.detail.checkpoints.in_flight = false;
+            // A late answer for a VM that is no longer on screen is dropped
+            // the same way a detail is (design 5.5).
+            if state.detail.checkpoints.for_vm != Some(vm) {
+                return effects;
+            }
+            match *result {
+                Ok(items) => {
+                    if let Some(name) = state.detail.checkpoints.apply(vm, items) {
+                        state.status.show(
+                            StatusKind::Info,
+                            format!("Checkpoint '{name}' is no longer available"),
+                        );
+                    }
+                }
+                Err(error) if error.is_backend_stopped() => state.fatal = Some(error),
+                Err(error) => state.status.show(StatusKind::Error, error.to_string()),
+            }
+        }
+        Action::OpFinished { vm, result, at } => {
+            state.ops.finish(vm);
+            match result {
+                Ok(message) => {
+                    state
+                        .status
+                        .show_timed(StatusKind::Info, message, at + SUCCESS_LIFETIME);
+                }
+                Err(failure) => {
+                    if failure.error.is_backend_stopped() {
+                        state.fatal = Some(failure.error.clone());
+                    }
+                    state.status.show(StatusKind::Error, failure.message);
+                }
+            }
+            // Whatever the operation did, the list is behind now (spec 3.7).
+            request_list_now(state, &mut effects);
         }
     }
     effects
@@ -260,282 +432,573 @@ fn start_list_fetch(state: &mut State, effects: &mut Vec<Effect>) {
     effects.push(Effect::FetchVmList);
 }
 
+/// Reads the checkpoints of the VM on screen, once (design 5.5). The result is
+/// filed under the VM it was asked for, so a late answer is recognisable.
+fn request_checkpoints(state: &mut State, effects: &mut Vec<Effect>) {
+    if let Some(id) = state.vm_list.selected {
+        if !state.detail.checkpoints.in_flight {
+            state.detail.checkpoints.in_flight = true;
+            state.detail.checkpoints.for_vm = Some(id);
+            effects.push(Effect::FetchCheckpoints(id));
+        }
+    }
+}
+
+/// Opens the action menu for whatever the popup rules say is the target
+/// (spec 3.3): the checkpoint on the Checkpoints tab, the selected VM else.
+fn open_menu(state: &mut State) {
+    let Some(vm) = state.vm_list.selected else {
+        return;
+    };
+    if state.focus == Focus::Detail && state.detail.tab == DetailTab::Checkpoints {
+        if let Some(entry) = state.detail.checkpoints.selected_entry() {
+            state.overlay = Overlay::Menu(MenuState {
+                vm,
+                kind: MenuKind::Checkpoint,
+                checkpoint: Some((entry.id, entry.name.clone())),
+                cursor: 0,
+            });
+            return;
+        }
+    }
+    let cursor = first_enabled_vm_item(state, vm);
+    state.overlay = Overlay::Menu(MenuState {
+        vm,
+        kind: MenuKind::Vm,
+        checkpoint: None,
+        cursor,
+    });
+}
+
+/// The state of `vm` as the list on screen has it.
+fn vm_state_of(state: &State, vm: VmId) -> Option<VmState> {
+    state
+        .vm_list
+        .items
+        .iter()
+        .find(|entry| entry.id == vm)
+        .map(|entry| entry.state)
+}
+
+/// The first menu row that can run, for a menu that just opened.
+fn first_enabled_vm_item(state: &State, vm: VmId) -> usize {
+    let Some(vm_state) = vm_state_of(state, vm) else {
+        return 0;
+    };
+    let in_flight = state.ops.in_flight(vm);
+    VM_MENU
+        .iter()
+        .position(|item| vm_item_enabled(*item, vm_state, in_flight))
+        .unwrap_or(0)
+}
+
+/// The rows the cursor may stand on, given the current state (design 5.6:
+/// computed every frame, so a menu that stays open follows the state).
+fn enabled_menu_indices(state: &State, menu: &MenuState) -> Vec<usize> {
+    match menu.kind {
+        MenuKind::Checkpoint => (0..CHECKPOINT_MENU.len()).collect(),
+        MenuKind::Vm => {
+            let Some(vm_state) = vm_state_of(state, menu.vm) else {
+                return Vec::new();
+            };
+            let in_flight = state.ops.in_flight(menu.vm);
+            VM_MENU
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| vm_item_enabled(**item, vm_state, in_flight))
+                .map(|(index, _)| index)
+                .collect()
+        }
+    }
+}
+
+/// Moves the menu cursor over the rows that can run, never onto a grey one.
+fn menu_move(state: &mut State, delta: isize) {
+    let Overlay::Menu(menu) = &state.overlay else {
+        return;
+    };
+    let (kind, cursor) = (menu.kind, menu.cursor);
+    let draft = MenuState {
+        vm: menu.vm,
+        kind,
+        checkpoint: menu.checkpoint.clone(),
+        cursor,
+    };
+    let enabled = enabled_menu_indices(state, &draft);
+    if enabled.is_empty() {
+        return;
+    }
+    let position = enabled
+        .iter()
+        .position(|&index| index == cursor)
+        .unwrap_or(0);
+    let next = (position as isize + delta).clamp(0, enabled.len() as isize - 1) as usize;
+    if let Overlay::Menu(menu) = &mut state.overlay {
+        menu.cursor = enabled[next];
+    }
+}
+
+/// Runs the highlighted menu row, or moves to the confirmation dialog first
+/// (spec 3.4).
+fn menu_select(state: &mut State, effects: &mut Vec<Effect>) {
+    let Overlay::Menu(menu) = state.overlay.clone() else {
+        return;
+    };
+    let Some(vm_name) = state.vm_list.name_of(menu.vm) else {
+        // The target vanished between the draw and the key; the next list
+        // update closes the menu (design 5.6).
+        return;
+    };
+    match menu.kind {
+        MenuKind::Vm => {
+            let Some(item) = VM_MENU.get(menu.cursor).copied() else {
+                return;
+            };
+            let Some(vm_state) = vm_state_of(state, menu.vm) else {
+                return;
+            };
+            if !vm_item_enabled(item, vm_state, state.ops.in_flight(menu.vm)) {
+                return;
+            }
+            if item.needs_confirm() {
+                state.overlay = Overlay::Confirm(ConfirmState {
+                    vm: menu.vm,
+                    question: vm_confirm_question(item, &vm_name),
+                    request: OpRequest::Vm {
+                        vm: menu.vm,
+                        vm_name: vm_name.clone(),
+                        op: item,
+                    },
+                });
+                return;
+            }
+            let request = if item == VmMenuItem::CreateCheckpoint {
+                OpRequest::CreateCheckpoint {
+                    vm: menu.vm,
+                    vm_name,
+                }
+            } else {
+                OpRequest::Vm {
+                    vm: menu.vm,
+                    vm_name: vm_name.clone(),
+                    op: item,
+                }
+            };
+            start_operation(state, request, effects);
+        }
+        MenuKind::Checkpoint => {
+            let Some(item) = CHECKPOINT_MENU.get(menu.cursor).copied() else {
+                return;
+            };
+            let Some((checkpoint, checkpoint_name)) = menu.checkpoint.clone() else {
+                return;
+            };
+            let request = match item {
+                CheckpointMenuItem::Restore => OpRequest::RestoreCheckpoint {
+                    vm: menu.vm,
+                    vm_name: vm_name.clone(),
+                    checkpoint,
+                    checkpoint_name: checkpoint_name.clone(),
+                },
+                CheckpointMenuItem::Remove => OpRequest::RemoveCheckpoint {
+                    vm: menu.vm,
+                    vm_name: vm_name.clone(),
+                    checkpoint,
+                    checkpoint_name: checkpoint_name.clone(),
+                },
+            };
+            if item.needs_confirm() {
+                state.overlay = Overlay::Confirm(ConfirmState {
+                    vm: menu.vm,
+                    question: checkpoint_confirm_question(item, &vm_name, &checkpoint_name),
+                    request,
+                });
+                return;
+            }
+            start_operation(state, request, effects);
+        }
+    }
+}
+
+/// The `y` of a confirmation dialog: the only key that runs anything (spec 3.4).
+fn confirm_yes(state: &mut State, effects: &mut Vec<Effect>) {
+    let Overlay::Confirm(confirm) = state.overlay.clone() else {
+        return;
+    };
+    start_operation(state, confirm.request, effects);
+}
+
+/// Marks the VM busy, closes the popup and asks the runner to perform the
+/// operation (spec 3.5).
+fn start_operation(state: &mut State, request: OpRequest, effects: &mut Vec<Effect>) {
+    state
+        .ops
+        .start(request.vm(), op_label(&request).to_string());
+    state.overlay = Overlay::None;
+    effects.push(Effect::RunOperation(request));
+}
+
+/// What the spinner row shows while the operation runs (spec 3.5).
+fn op_label(request: &OpRequest) -> &'static str {
+    match request {
+        OpRequest::Vm { op, .. } => match op {
+            VmMenuItem::Start => "starting",
+            VmMenuItem::Stop | VmMenuItem::StopForce => "stopping",
+            VmMenuItem::Restart | VmMenuItem::RestartForce => "restarting",
+            VmMenuItem::Save => "saving",
+            VmMenuItem::Pause => "pausing",
+            VmMenuItem::Resume => "resuming",
+            VmMenuItem::CreateCheckpoint => "creating checkpoint",
+        },
+        OpRequest::CreateCheckpoint { .. } => "creating checkpoint",
+        OpRequest::RestoreCheckpoint { .. } => "restoring checkpoint",
+        OpRequest::RemoveCheckpoint { .. } => "removing checkpoint",
+    }
+}
+
+/// Closes a menu or a dialog whose target just vanished from the list, and
+/// says so unless the same VM was already announced as gone (design 5.6,
+/// acceptance of spec 3.6).
+fn close_overlay_of_a_vanished_vm(
+    state: &mut State,
+    target: Option<VmId>,
+    name: Option<String>,
+    selection_vanished: &Option<String>,
+) {
+    let Some(target) = target else {
+        return;
+    };
+    if state.vm_list.name_of(target).is_some() {
+        return;
+    }
+    state.overlay = Overlay::None;
+    if let Some(name) = name {
+        if selection_vanished.as_deref() != Some(name.as_str()) {
+            state.status.show(
+                StatusKind::Info,
+                format!("VM '{name}' is no longer available"),
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use hypervctl_core::{stopped_error, MemoryConfig, RawError, VmDetail, VmState};
+    use std::time::Duration;
+
+    use crossterm::event::{KeyCode, KeyModifiers};
+    use hypervctl_core::{Checkpoint, CheckpointId, CheckpointKind};
     use uuid::Uuid;
 
     use super::*;
+    use crate::tui::store::menu::vm_item_enabled;
 
-    fn id(index: u128) -> VmId {
-        VmId::new(Uuid::from_u128(index << 96))
-    }
-
-    fn vm(index: u128, name: &str) -> VmSummary {
+    fn vm(index: u128, name: &str, state: VmState) -> VmSummary {
         VmSummary {
-            id: id(index),
+            id: VmId::new(Uuid::from_u128(index << 96)),
             name: name.to_string(),
-            state: VmState::Off,
+            state,
             cpu_usage_percent: None,
             memory_assigned_bytes: None,
             uptime: None,
-            generation: None,
+            generation: Some(2),
         }
     }
 
-    fn detail(summary: VmSummary) -> VmDetail {
-        VmDetail {
-            summary,
-            processor_count: 1,
-            memory: MemoryConfig {
-                startup_bytes: 1,
-                dynamic_enabled: false,
-                min_bytes: None,
-                max_bytes: None,
-            },
-            disks: Vec::new(),
-            nics: Vec::new(),
-            checkpoint_count: 0,
-            config_path: String::new(),
-            integration_services: Vec::new(),
-            notes: None,
-        }
-    }
-
-    fn state_with(items: Vec<VmSummary>) -> State {
-        State::new(items, 80, 24)
-    }
-
-    fn list_loaded(state: &mut State, items: Vec<VmSummary>) -> Vec<Effect> {
-        reduce(state, Action::VmListLoaded(Box::new(Ok(items))))
-    }
-
-    fn detail_loaded(state: &mut State, id: VmId, detail: VmDetail) -> Vec<Effect> {
-        reduce(
-            state,
-            Action::VmDetailLoaded {
-                id,
-                result: Box::new(Ok(detail)),
-            },
-        )
-    }
-
-    fn detail_failed(state: &mut State, id: VmId, error: HyperVError) -> Vec<Effect> {
-        reduce(
-            state,
-            Action::VmDetailLoaded {
-                id,
-                result: Box::new(Err(error)),
-            },
-        )
-    }
-
-    #[test]
-    fn the_selection_is_kept_by_id_when_the_list_changes() {
-        let mut state = state_with(vec![vm(1, "web-01"), vm(2, "web-02")]);
-        reduce(&mut state, Action::SelectNext);
-        assert_eq!(state.vm_list.selected, Some(id(2)), "web-02 is selected");
-
-        // The same VMs, in a different order: the selection must not follow
-        // the row (acceptance 9).
-        list_loaded(&mut state, vec![vm(2, "web-02"), vm(1, "web-01")]);
-        assert_eq!(
-            state.vm_list.selected,
-            Some(id(2)),
-            "the order does not matter"
+    fn sample_state() -> State {
+        // The list sorts by name, so web-01 has to be selected by hand.
+        let mut state = State::new(
+            vec![
+                vm(1, "web-01", VmState::Running),
+                vm(2, "web-02", VmState::Off),
+                vm(3, "db-01", VmState::Saved),
+                vm(4, "ghost", VmState::Unknown(42)),
+            ],
+            80,
+            24,
         );
-        assert_eq!(state.status.current, None, "nothing vanished");
-    }
-
-    #[test]
-    fn a_vanished_selection_falls_back_to_the_nearest_row() {
-        // Sorted: db-01, web-01, web-02.
-        let mut state = state_with(vec![vm(1, "web-01"), vm(2, "web-02"), vm(3, "db-01")]);
-        reduce(&mut state, Action::SelectFirst);
-        assert_eq!(state.vm_list.selected, Some(id(3)), "db-01 sorts first");
-
-        list_loaded(&mut state, vec![vm(1, "web-01"), vm(2, "web-02")]);
-        assert_eq!(
-            state.vm_list.selected,
-            Some(id(1)),
-            "the nearest row is web-01"
-        );
-        let message = state
-            .status
-            .current
-            .as_ref()
-            .unwrap_or_else(|| panic!("the user is told about the vanished VM"));
-        assert_eq!(message.text, "VM 'db-01' is no longer available");
-    }
-
-    #[test]
-    fn an_empty_list_clears_the_selection() {
-        let mut state = state_with(vec![vm(1, "web-01")]);
-        list_loaded(&mut state, Vec::new());
-        assert_eq!(state.vm_list.selected, None);
-        assert!(state.detail.detail.is_none());
-    }
-
-    #[test]
-    fn a_late_detail_of_another_vm_is_discarded() {
-        let mut state = state_with(vec![vm(1, "web-01"), vm(2, "web-02")]);
-        let first = state
+        state.vm_list.selected = Some(VmId::new(Uuid::from_u128(1 << 96)));
+        state
             .vm_list
-            .selected
-            .unwrap_or_else(|| panic!("the first VM is selected right after the state is built"));
-        detail_loaded(&mut state, first, detail(vm(1, "web-01")));
-        assert!(state.detail.detail.is_some());
+            .items
+            .sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+        state
+    }
 
-        reduce(&mut state, Action::SelectNext);
-        let second = state.vm_list.selected.unwrap_or_else(|| panic!("web-02"));
-        assert!(
-            state.detail.detail.is_none(),
-            "the pane is cleared on the move"
-        );
-
-        // The answer for the first VM arrives late and belongs to no selection
-        // any more (acceptance 10).
-        let effects = detail_loaded(&mut state, first, detail(vm(1, "web-01")));
+    fn open_vm_menu(state: &mut State) {
+        let effects = reduce(state, Action::OpenMenu);
         assert!(effects.is_empty());
-        assert!(state.detail.detail.is_none(), "the stale detail is dropped");
+        assert!(matches!(state.overlay, Overlay::Menu(_)));
+    }
 
-        // The answer for the selected VM is kept.
-        detail_loaded(&mut state, second, detail(vm(2, "web-02")));
-        assert!(state.detail.detail.is_some());
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::empty())
+    }
+
+    fn menu_cursor(state: &State) -> Option<usize> {
+        match &state.overlay {
+            Overlay::Menu(menu) => Some(menu.cursor),
+            _ => None,
+        }
     }
 
     #[test]
-    fn a_tick_starts_no_second_fetch_and_a_manual_refresh_waits_its_turn() {
-        let mut state = state_with(vec![vm(1, "web-01")]);
-        let effects = reduce(&mut state, Action::RefreshTick);
-        assert_eq!(effects, vec![Effect::FetchVmList]);
-        assert!(state.vm_list.refresh_in_flight);
-
-        // A tick while the fetch runs does nothing (acceptance 11).
-        assert_eq!(reduce(&mut state, Action::RefreshTick), Vec::new());
-
-        // A manual refresh while the fetch runs is remembered once.
-        assert_eq!(reduce(&mut state, Action::RefreshNow), Vec::new());
-        assert!(state.vm_list.refresh_again);
-
-        // The answer completes the fetch; the remembered refresh runs now.
-        let effects = list_loaded(&mut state, vec![vm(1, "web-01")]);
-        assert!(!state.vm_list.refresh_again);
-        assert!(
-            state.vm_list.refresh_in_flight,
-            "the remembered refresh started"
-        );
-        assert_eq!(
-            effects,
-            vec![Effect::FetchVmDetail(id(1)), Effect::FetchVmList],
-            "the detail of the selection and the remembered refresh"
-        );
+    fn the_menu_enables_only_what_the_specification_table_allows() {
+        use VmMenuItem::*;
+        let table = [
+            (VmState::Off, Start, true),
+            (VmState::Saved, Start, true),
+            (VmState::Paused, Start, true),
+            (VmState::Running, Start, false),
+            (VmState::Running, Stop, true),
+            (VmState::Off, Stop, false),
+            (VmState::Running, StopForce, true),
+            (VmState::Paused, StopForce, true),
+            (VmState::Off, StopForce, false),
+            (VmState::Running, Restart, true),
+            (VmState::Running, RestartForce, true),
+            (VmState::Off, Restart, false),
+            (VmState::Running, Save, true),
+            (VmState::Running, Pause, true),
+            (VmState::Paused, Resume, true),
+            (VmState::Off, Resume, false),
+            (VmState::Running, CreateCheckpoint, true),
+            (VmState::Off, CreateCheckpoint, true),
+            (VmState::Saved, CreateCheckpoint, true),
+            (VmState::Paused, CreateCheckpoint, true),
+        ];
+        for (vm_state, item, expected) in table {
+            assert_eq!(
+                vm_item_enabled(item, vm_state, false),
+                expected,
+                "{item:?} in {vm_state:?}"
+            );
+        }
+        for item in VM_MENU {
+            assert!(!vm_item_enabled(*item, VmState::Unknown(7), false));
+            assert!(!vm_item_enabled(*item, VmState::Running, true));
+        }
     }
 
     #[test]
-    fn a_backend_change_refreshes_immediately() {
-        let mut state = state_with(vec![vm(1, "web-01")]);
-        let effects = reduce(&mut state, Action::BackendChanged);
-        assert_eq!(effects, vec![Effect::FetchVmList]);
-        assert!(state.vm_list.refresh_in_flight);
+    fn the_cursor_skips_disabled_rows() {
+        let mut state = sample_state();
+        open_vm_menu(&mut state);
+        let stop = VM_MENU
+            .iter()
+            .position(|item| *item == VmMenuItem::Stop)
+            .unwrap_or(0);
+        assert_eq!(menu_cursor(&state), Some(stop));
+        let _ = reduce(&mut state, Action::MenuUp);
+        assert_eq!(menu_cursor(&state), Some(stop));
+        let force = VM_MENU
+            .iter()
+            .position(|item| *item == VmMenuItem::StopForce)
+            .unwrap_or(0);
+        let _ = reduce(&mut state, Action::MenuDown);
+        assert_eq!(menu_cursor(&state), Some(force));
     }
 
     #[test]
-    fn a_backend_that_stopped_ends_the_tui_with_an_error() {
-        let mut state = state_with(vec![vm(1, "web-01")]);
-        reduce(
-            &mut state,
-            Action::VmListLoaded(Box::new(Err(stopped_error()))),
-        );
-        assert!(
-            state
-                .fatal
-                .as_ref()
-                .is_some_and(HyperVError::is_backend_stopped),
-            "a stopped actor is fatal (design 5.5)"
-        );
-
-        let mut state = state_with(vec![vm(1, "web-01")]);
-        detail_failed(&mut state, id(1), stopped_error());
-        assert!(state.fatal.is_some());
+    fn a_force_stop_asks_before_it_runs_and_only_y_runs_it() {
+        let mut state = sample_state();
+        open_vm_menu(&mut state);
+        let _ = reduce(&mut state, Action::MenuDown);
+        let _ = reduce(&mut state, Action::MenuSelect);
+        assert!(matches!(state.overlay, Overlay::Confirm(_)));
+        let Overlay::Confirm(confirm) = state.overlay.clone() else {
+            unreachable!("the dialog just opened");
+        };
+        assert!(confirm.question.contains("web-01"));
+        for cancel in [
+            Action::Input(key(KeyCode::Enter)),
+            Action::Input(key(KeyCode::Esc)),
+        ] {
+            let mut cancelled = sample_state();
+            open_vm_menu(&mut cancelled);
+            let _ = reduce(&mut cancelled, Action::MenuDown);
+            let _ = reduce(&mut cancelled, Action::MenuSelect);
+            let _ = reduce(&mut cancelled, cancel);
+            assert!(matches!(cancelled.overlay, Overlay::None));
+            assert!(cancelled.ops.is_empty());
+        }
+        let _ = reduce(&mut state, Action::ConfirmYes);
+        assert!(matches!(state.overlay, Overlay::None));
+        assert!(state.ops.in_flight(VmId::new(Uuid::from_u128(1 << 96))));
     }
 
     #[test]
-    fn any_other_failure_keeps_the_screen_and_says_the_list_is_out_of_date() {
-        let mut state = state_with(vec![vm(1, "web-01")]);
-        reduce(
-            &mut state,
-            Action::VmListLoaded(Box::new(Err(HyperVError::backend(RawError::new(
-                "wmi is angry",
-            ))))),
-        );
-        assert!(state.fatal.is_none());
-        assert!(state
-            .vm_list
-            .stale
-            .as_ref()
-            .is_some_and(|stale| stale.contains("wmi is angry")));
-
-        let mut state = state_with(vec![vm(1, "web-01")]);
-        detail_failed(
-            &mut state,
-            id(1),
-            HyperVError::backend(RawError::new("wmi is angry")),
-        );
-        assert!(state.fatal.is_none());
-        let message = state
+    fn a_vanished_target_closes_the_menu_and_is_announced_once() {
+        let mut state = sample_state();
+        open_vm_menu(&mut state);
+        let remaining = vec![
+            vm(2, "web-02", VmState::Off),
+            vm(3, "db-01", VmState::Saved),
+        ];
+        let _ = reduce(&mut state, Action::VmListLoaded(Box::new(Ok(remaining))));
+        assert!(matches!(state.overlay, Overlay::None));
+        let text = state
             .status
             .current
             .as_ref()
-            .unwrap_or_else(|| panic!("the failure is shown"));
-        assert_eq!(message.kind, StatusKind::Error);
+            .map(|message| message.text.clone())
+            .unwrap_or_default();
+        assert!(text.contains("no longer available"), "{text}");
+        assert!(text.contains("web-01"), "{text}");
+        assert_eq!(
+            state.vm_list.selected,
+            Some(VmId::new(Uuid::from_u128(2 << 96)))
+        );
     }
 
     #[test]
-    fn the_keys_of_the_list_reach_the_keymap_and_the_detail_follows() {
-        let mut state = state_with(vec![vm(1, "web-01"), vm(2, "web-02")]);
+    fn create_checkpoint_runs_without_a_dialog() {
+        let mut state = sample_state();
+        open_vm_menu(&mut state);
+        let target = VM_MENU
+            .iter()
+            .position(|item| *item == VmMenuItem::CreateCheckpoint)
+            .unwrap_or(usize::MAX);
+        while menu_cursor(&state) != Some(target) {
+            let before = menu_cursor(&state).unwrap_or(0);
+            let _ = reduce(&mut state, Action::MenuDown);
+            if menu_cursor(&state) == Some(before) {
+                break;
+            }
+        }
+        assert_eq!(menu_cursor(&state), Some(target));
+        let _ = reduce(&mut state, Action::MenuSelect);
+        assert!(matches!(state.overlay, Overlay::None));
+        assert!(state.ops.in_flight(VmId::new(Uuid::from_u128(1 << 96))));
+    }
+
+    #[test]
+    fn help_comes_and_goes_without_losing_a_menu() {
+        let mut state = sample_state();
+        open_vm_menu(&mut state);
+        let _ = reduce(&mut state, Action::ToggleHelp);
+        assert!(matches!(state.overlay, Overlay::Menu(_)));
+        let _ = reduce(&mut state, Action::CloseOverlay);
+        assert!(matches!(state.overlay, Overlay::None));
+        let _ = reduce(&mut state, Action::ToggleHelp);
+        assert!(matches!(state.overlay, Overlay::Help));
+        let _ = reduce(&mut state, Action::ToggleHelp);
+        assert!(matches!(state.overlay, Overlay::None));
+    }
+
+    #[test]
+    fn a_finished_operation_reports_and_asks_for_a_fresh_list() {
+        let mut state = sample_state();
+        let id = VmId::new(Uuid::from_u128(1 << 96));
+        state.ops.start(id, "stopping".to_string());
+        let at = Instant::now();
         let effects = reduce(
             &mut state,
-            Action::Input(crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::Char('j'),
-                crossterm::event::KeyModifiers::empty(),
-            )),
+            Action::OpFinished {
+                vm: id,
+                result: Ok("web-01: stopped".to_string()),
+                at,
+            },
         );
-        assert_eq!(state.vm_list.selected, Some(id(2)), "'j' moves down");
-        assert_eq!(
-            effects,
-            vec![Effect::FetchVmDetail(id(2))],
-            "the detail follows"
-        );
-
-        // Enter focuses the detail pane; Tab toggles back.
-        reduce(
+        assert!(!state.ops.in_flight(id));
+        let text = state
+            .status
+            .current
+            .as_ref()
+            .map(|message| message.text.clone())
+            .unwrap_or_default();
+        assert_eq!(text, "web-01: stopped");
+        assert!(state.status.needs_tick());
+        assert!(effects.contains(&Effect::FetchVmList));
+        let _ = reduce(
             &mut state,
-            Action::Input(crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::Enter,
-                crossterm::event::KeyModifiers::empty(),
-            )),
+            Action::UiTick(at + SUCCESS_LIFETIME + Duration::from_millis(1)),
         );
-        assert_eq!(state.focus, Focus::Detail);
-        reduce(
-            &mut state,
-            Action::Input(crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::Tab,
-                crossterm::event::KeyModifiers::empty(),
-            )),
-        );
-        assert_eq!(state.focus, Focus::List);
+        assert!(state.status.current.is_none());
     }
 
     #[test]
-    fn scrolling_the_detail_never_goes_below_zero() {
-        let mut state = state_with(vec![vm(1, "web-01")]);
-        reduce(&mut state, Action::ScrollUp);
-        assert_eq!(state.detail.scroll, 0);
-        reduce(&mut state, Action::ScrollDown);
-        reduce(&mut state, Action::ScrollDown);
-        assert_eq!(state.detail.scroll, 2);
-        reduce(&mut state, Action::ScrollUp);
-        assert_eq!(state.detail.scroll, 1);
+    fn the_checkpoints_tab_reads_the_checkpoints_of_the_selected_vm() {
+        let mut state = sample_state();
+        let effects = reduce(&mut state, Action::SelectTab(DetailTab::Checkpoints));
+        assert_eq!(
+            effects,
+            vec![Effect::FetchCheckpoints(VmId::new(Uuid::from_u128(
+                1 << 96
+            )))]
+        );
+        assert!(state.detail.checkpoints.in_flight);
+        let again = reduce(&mut state, Action::SelectTab(DetailTab::Checkpoints));
+        assert!(again.is_empty());
+        let notified = reduce(
+            &mut state,
+            Action::CheckpointsChanged(VmId::new(Uuid::from_u128(1 << 96))),
+        );
+        assert!(notified.is_empty());
+    }
+
+    #[test]
+    fn a_checkpoint_vanishing_is_announced() {
+        let mut state = sample_state();
+        let vm = VmId::new(Uuid::from_u128(1 << 96));
+        let first = Checkpoint {
+            id: CheckpointId::new(Uuid::from_u128(0x100 << 96)),
+            name: "before-upgrade".to_string(),
+            kind: CheckpointKind::Standard,
+            created: None,
+            parent_id: None,
+        };
+        let _ = reduce(&mut state, Action::SelectTab(DetailTab::Checkpoints));
+        state.detail.checkpoints.in_flight = false;
+        let _ = reduce(
+            &mut state,
+            Action::CheckpointsLoaded {
+                vm,
+                result: Box::new(Ok(vec![first])),
+            },
+        );
+        assert_eq!(state.detail.checkpoints.items.len(), 1);
+        state.detail.checkpoints.in_flight = false;
+        let _ = reduce(
+            &mut state,
+            Action::CheckpointsLoaded {
+                vm,
+                result: Box::new(Ok(Vec::new())),
+            },
+        );
+        let text = state
+            .status
+            .current
+            .as_ref()
+            .map(|message| message.text.clone())
+            .unwrap_or_default();
+        assert_eq!(text, "Checkpoint 'before-upgrade' is no longer available");
+    }
+
+    #[test]
+    fn a_menu_on_the_checkpoints_tab_targets_the_selected_checkpoint() {
+        let mut state = sample_state();
+        state.focus = Focus::Detail;
+        state.detail.tab = DetailTab::Checkpoints;
+        let vm = VmId::new(Uuid::from_u128(1 << 96));
+        let entry = Checkpoint {
+            id: CheckpointId::new(Uuid::from_u128(0x100 << 96)),
+            name: "before-upgrade".to_string(),
+            kind: CheckpointKind::Standard,
+            created: None,
+            parent_id: None,
+        };
+        state.detail.checkpoints.apply(vm, vec![entry]);
+        open_vm_menu(&mut state);
+        let Overlay::Menu(menu) = &state.overlay else {
+            unreachable!("the menu just opened");
+        };
+        assert_eq!(menu.kind, MenuKind::Checkpoint);
+        assert_eq!(
+            menu.checkpoint.as_ref().map(|(_, name)| name.as_str()),
+            Some("before-upgrade")
+        );
+        let _ = reduce(&mut state, Action::MenuSelect);
+        assert!(matches!(state.overlay, Overlay::Confirm(_)));
     }
 }

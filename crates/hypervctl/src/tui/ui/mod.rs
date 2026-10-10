@@ -1,13 +1,13 @@
 //! The layout: the VM list on top, the detail pane below it, the status bar
 //! last (spec 3.2). Below the minimum size the TUI draws one notice instead of
-//! a broken layout (spec 3.1).
+//! a broken layout (spec 3.1). Popups are drawn over the panes.
 
 use ratatui::layout::{Constraint, Layout};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::tui::features;
-use crate::tui::store::{State, UiState};
+use crate::tui::store::{Overlay, State, UiState};
 
 /// Draws one frame of `state` over the whole terminal.
 pub fn draw(frame: &mut Frame, state: &State) {
@@ -32,4 +32,10 @@ pub fn draw(frame: &mut Frame, state: &State) {
     features::vm_list::render(frame, list_area, state);
     features::detail::render(frame, detail_area, state);
     features::status_bar::render(frame, status_area, state);
+    match &state.overlay {
+        Overlay::Menu(_) => features::menu::render_menu(frame, area, state),
+        Overlay::Confirm(_) => features::menu::render_confirm(frame, area, state),
+        Overlay::Help => features::help::render(frame, area, state.focus),
+        Overlay::None => {}
+    }
 }

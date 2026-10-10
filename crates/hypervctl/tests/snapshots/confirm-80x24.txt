@@ -1,0 +1,24 @@
+┌VMs───────────────────────────────────────────────────────────────────────────┐
+│> db-01                                   Saved        | creating checkpoint  │
+│  ghost                                   Unknown(42)      -         -  -     │
+│  web-01                                  Running          -         -  -     │
+│  web-02                                  Off              -         -  -     │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ 1 Details │ 2 Checkpoints                                                    │
+│Name                db-01                                                     │
+│Id                  00000003                                                  │
+│State               Saved                                                     │
+│Generation          2                                                         │
+│CPU                 -                                                         │
+│Uptime              -                                                         │
+│Processors          2                                                         │
+│Startup memory      2.0 GB                                                    │
+│Dynamic memory      enabled                                                   │
+└──────────────────────────────────────────────────────────────────────────────┘
+q/Ctrl+C quit  Tab focus  r refresh  Space menu  ? help  1 details tab  2 checkp

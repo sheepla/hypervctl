@@ -21,4 +21,4 @@
 │Startup memory      2.0 GB                                                    │
 │Dynamic memory      enabled                                                   │
 └──────────────────────────────────────────────────────────────────────────────┘
-q/Ctrl+C quit  Tab focus  r refresh  1 details tab  2 checkpoints tab  j/Down mo
+q/Ctrl+C quit  Tab focus  r refresh  Space menu  ? help  1 details tab  2 checkp

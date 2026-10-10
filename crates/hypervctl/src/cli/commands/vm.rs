@@ -117,7 +117,7 @@ fn describe(success: &OpSuccess, op: VmOp) -> String {
     }
 }
 
-fn past_tense(op: VmOp) -> &'static str {
+pub(crate) fn past_tense(op: VmOp) -> &'static str {
     match op {
         VmOp::Start => "started",
         VmOp::Stop | VmOp::StopForce => "stopped",

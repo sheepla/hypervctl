@@ -58,7 +58,8 @@ impl VmListState {
         vanished
     }
 
-    fn name_of(&self, id: VmId) -> Option<String> {
+    /// The name of `id`, when it is still in the list.
+    pub fn name_of(&self, id: VmId) -> Option<String> {
         self.items
             .iter()
             .find(|vm| vm.id == id)
