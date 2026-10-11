@@ -152,6 +152,41 @@ fn list_switches_reads_the_inventory() {
     }
 }
 
+#[test]
+#[ignore = "requires a Windows host with Hyper-V"]
+fn list_vhds_reports_attachments_with_controller_slots() {
+    let mut backend = must_connect(backend());
+    let all = backend.list_vhds(None).expect("list_vhds");
+    for attached in &all {
+        let att = &attached.attachment;
+        // Every attachment must have a real VM id (not nil) and a path.
+        assert_ne!(
+            att.vm_id,
+            VmId::new(uuid::Uuid::nil()),
+            "SDRD walk must resolve the owning VM"
+        );
+        assert!(!att.path.as_os_str().is_empty(), "path must not be empty");
+        assert!(
+            att.controller.number < 4,
+            "controller number {} is implausible",
+            att.controller.number
+        );
+        assert!(
+            att.controller.lun < 64,
+            "LUN {} is implausible",
+            att.controller.lun
+        );
+    }
+    // Filtering by a known VM returns only that VM's disks.
+    let listed = backend.list_vms().expect("list_vms");
+    if let Some(first) = listed.first() {
+        let filtered = backend.list_vhds(Some(first.id)).expect("filter");
+        for attached in &filtered {
+            assert_eq!(attached.attachment.vm_id, first.id);
+        }
+    }
+}
+
 /// Waits until `id` reaches `goal`, or fails with the last observed state.
 fn wait_for_state(backend: &mut WmiBackend, id: VmId, goal: VmState) {
     for _ in 0..60 {

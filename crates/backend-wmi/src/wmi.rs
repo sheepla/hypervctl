@@ -120,13 +120,23 @@ struct JobRow {
     error_description: Option<String>,
 }
 
-/// A row of `Msvm_DiskDrive` (one attached virtual disk).
+/// A row of `Msvm_StorageAllocationSettingData` (one virtual disk attachment).
+/// `InstanceID` is `Microsoft:{vm-guid}\{controller-guid}\{controller-num}\{address}\L`.
 #[derive(Debug, Deserialize)]
-struct DiskDriveRow {
-    #[serde(rename = "DeviceNumber")]
-    device_number: Option<u32>,
-    #[serde(rename = "Connection")]
-    connection: Option<Vec<String>>,
+struct SdrdRow {
+    #[serde(rename = "InstanceID")]
+    instance_id: String,
+    #[serde(rename = "HostResource")]
+    host_resource: Option<Vec<String>>,
+}
+
+/// A row of `Msvm_ResourceAllocationSettingData` used to classify a controller.
+#[derive(Debug, Deserialize)]
+struct ControllerRasdRow {
+    #[serde(rename = "InstanceID")]
+    instance_id: String,
+    #[serde(rename = "ResourceType")]
+    resource_type: Option<u16>,
 }
 
 impl WmiBackend {
@@ -386,6 +396,29 @@ fn host_name() -> String {
     std::env::var("COMPUTERNAME").unwrap_or_else(|_| String::from("localhost"))
 }
 
+/// Splits an SDRD `InstanceID` into (vm_id, controller_number, lun).
+/// Format: `Microsoft:{vm-guid}\{controller-guid}\{controller-num}\{address}\L`.
+/// Returns `None` for definition rows (`Microsoft:Definition\...`).
+fn parse_sdrd_instance_id(instance_id: &str) -> Option<(uuid::Uuid, u8, u8)> {
+    let rest = instance_id.strip_prefix("Microsoft:")?;
+    let mut parts = rest.split('\\');
+    let vm_guid = parts.next()?.parse::<uuid::Uuid>().ok()?;
+    let _controller_guid = parts.next()?;
+    let controller_number = parts.next()?.parse::<u8>().ok()?;
+    let lun = parts.next()?.parse::<u8>().ok()?;
+    Some((vm_guid, controller_number, lun))
+}
+
+/// Maps a controller RASD's `ResourceType` to [`ControllerKind`].
+fn controller_kind_from_rasd(resource_type: Option<u16>) -> ControllerKind {
+    match resource_type {
+        Some(5) => ControllerKind::Ide,
+        Some(6) => ControllerKind::Scsi,
+        Some(7) => ControllerKind::Sata,
+        other => ControllerKind::Unknown(other.unwrap_or(0)),
+    }
+}
+
 /// Reads `ReturnValue` from a method out-params wrapper. Missing or wrong-typed
 /// is reported as a backend error rather than guessed.
 fn return_value(out: &IWbemClassWrapper) -> Result<u32, HyperVError> {
@@ -532,8 +565,14 @@ impl HyperV for WmiBackend {
             .and_then(|row| row.notes.clone())
             .map(|lines| lines.join("\n"))
             .filter(|n| !n.is_empty());
-        // Disks, NICs and integration services need association walks that M7
-        // adds; the defaults keep the type honest (0 / empty).
+        // Disks come from the SDRD walk (same as list_vhds, filtered to this VM).
+        let disks: Vec<VhdAttachment> = self
+            .list_vhds(Some(id))?
+            .into_iter()
+            .map(|attached| attached.attachment)
+            .collect();
+        // NICs and integration services need association walks that are not
+        // yet implemented; the defaults keep the type honest (empty).
         let memory = MemoryConfig {
             startup_bytes: summary.memory_assigned_bytes.unwrap_or(0),
             dynamic_enabled: false,
@@ -544,7 +583,7 @@ impl HyperV for WmiBackend {
             summary,
             processor_count: u32::from(processor_count),
             memory,
-            disks: Vec::new(),
+            disks,
             nics: Vec::new(),
             checkpoint_count,
             config_path,
@@ -667,37 +706,86 @@ impl HyperV for WmiBackend {
                 });
             }
         }
-        let rows: Vec<DiskDriveRow> =
-            self.run_query("SELECT DeviceNumber, Connection FROM Msvm_DiskDrive")?;
+        // SDRD holds the VHD path in HostResource; DiskDrive does not.
+        let rows: Vec<SdrdRow> = self
+            .run_query("SELECT InstanceID, HostResource FROM Msvm_StorageAllocationSettingData")?;
+        // Collect the controller GUIDs referenced by the SDRDs so we can look
+        // up each controller's ResourceType once (IDE=5, SCSI=6, SATA=7).
+        let mut controller_keys: Vec<String> = Vec::new();
+        for row in &rows {
+            if row.host_resource.as_ref().is_some_and(|h| !h.is_empty()) {
+                if let Some(rest) = row.instance_id.strip_prefix("Microsoft:") {
+                    if let Some((vm_guid, _num, _lun)) = parse_sdrd_instance_id(&row.instance_id) {
+                        let _ = vm_guid;
+                        if let Some(controller_guid) = rest.split('\\').nth(1) {
+                            let key = format!("Microsoft:\\{controller_guid}\\");
+                            if !controller_keys.contains(&key) {
+                                controller_keys.push(key);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // One query for all controller RASDs; build a map from the InstanceID
+        // prefix to the ResourceType so we can classify each attachment.
+        let controller_rows: Vec<ControllerRasdRow> = self
+            .run_query("SELECT InstanceID, ResourceType FROM Msvm_ResourceAllocationSettingData")?;
+        let mut controller_map: std::collections::HashMap<String, Option<u16>> =
+            std::collections::HashMap::new();
+        for key in &controller_keys {
+            for crow in &controller_rows {
+                if crow.instance_id.starts_with(key) && crow.instance_id.matches('\\').count() == 2
+                {
+                    // `Microsoft:\{guid}\{number}` has exactly two backslashes.
+                    controller_map.insert(key.clone(), crow.resource_type);
+                    break;
+                }
+            }
+        }
         let mut attached = Vec::new();
         for row in rows {
             let path = row
-                .connection
+                .host_resource
                 .as_ref()
                 .and_then(|paths| paths.first().cloned())
                 .unwrap_or_default();
             if path.is_empty() {
                 continue;
             }
-            // The owning VM is not on the DiskDrive row; the controller walk
-            // lands with M7. Attachments are still listed so `vhd list` works
-            // (design 3.1: file info may be incomplete).
+            let Some((vm_guid, controller_number, lun)) = parse_sdrd_instance_id(&row.instance_id)
+            else {
+                continue;
+            };
+            if let Some(filter) = vm {
+                if VmId::new(vm_guid) != filter {
+                    continue;
+                }
+            }
+            // Classify the controller via the RASD map.
+            let kind = row
+                .instance_id
+                .strip_prefix("Microsoft:")
+                .and_then(|rest| rest.split('\\').nth(1))
+                .and_then(|cg| controller_map.get(&format!("Microsoft:\\{cg}\\")))
+                .map_or(ControllerKind::Unknown(0), |rt| {
+                    controller_kind_from_rasd(*rt)
+                });
             let info = vhd_info_from_path(Path::new(&path));
             attached.push(AttachedVhd {
                 attachment: VhdAttachment {
-                    vm_id: VmId::new(uuid::Uuid::nil()),
+                    vm_id: VmId::new(vm_guid),
                     vm_name: String::new(),
                     controller: Controller {
-                        kind: ControllerKind::Unknown(0),
-                        number: row.device_number.unwrap_or(0) as u8,
-                        lun: 0,
+                        kind,
+                        number: controller_number,
+                        lun,
                     },
                     path: PathBuf::from(&path),
                 },
                 info,
             });
         }
-        let _ = vm;
         Ok(attached)
     }
 
