@@ -1,4 +1,4 @@
-//! Real-Hyper-V acceptance tests for the read-only WMI backend (M6).
+//! Real-Hyper-V acceptance tests for the WMI backend (M6 reads, M7 mutations).
 //!
 //! Every test is `#[ignore]`d: they need a Windows host with Hyper-V and a
 //! non-empty VM inventory, so they never run on CI. Run them with:
@@ -7,13 +7,27 @@
 //! cargo test -p hypervctl-backend-wmi --test real_machine -- --ignored
 //! ```
 //!
-//! Design 6.2 applies: never create, start, stop, save, pause or delete
-//! anything. These tests only read.
+//! Design 6.2 applies: mutation tests only touch VMs whose name starts with
+//! `hypervctl-test-`. The helper refuses anything else (M7 acceptance).
 
 #![cfg(windows)]
 
 use hypervctl_backend_wmi::WmiBackend;
-use hypervctl_core::{HyperV, TargetKind, VmState};
+use hypervctl_core::{HyperV, HyperVError, RequestedState, TargetKind, VmId, VmState};
+use std::sync::{Mutex, MutexGuard, OnceLock};
+
+/// Prefix every mutation test requires; see design 6.2.
+const SAFE_PREFIX: &str = "hypervctl-test-";
+
+/// Serializes mutation tests: they all operate on the same VM, so running
+/// them in parallel races on EnabledState and leaves the VM in an unknown
+/// state for the next test.
+fn mutation_lock() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn backend() -> WmiBackend {
     WmiBackend::connect_or_unavailable()
@@ -25,6 +39,32 @@ fn must_connect(mut backend: WmiBackend) -> WmiBackend {
         Ok(_) => backend,
         Err(error) => panic!("cannot reach Hyper-V: {error}"),
     }
+}
+
+/// The id of a VM whose name starts with [`SAFE_PREFIX`], or a clear panic.
+fn must_find_test_vm(backend: &mut WmiBackend) -> VmId {
+    let vms = backend.list_vms().expect("list_vms");
+    vms.iter()
+        .find(|vm| vm.name.starts_with(SAFE_PREFIX))
+        .map(|vm| vm.id)
+        .unwrap_or_else(|| {
+            panic!("no VM named {SAFE_PREFIX}* exists; create one before running this test")
+        })
+}
+
+/// Refuses to hand back a VM the mutation tests must not touch.
+fn assert_safe_vm(backend: &mut WmiBackend, id: VmId) {
+    let detail = backend.get_vm(id).expect("get_vm");
+    assert!(
+        is_safe_vm_name(&detail.summary.name),
+        "refusing to mutate '{}'; only {SAFE_PREFIX}* VMs are safe targets",
+        detail.summary.name
+    );
+}
+
+/// Whether a VM name is inside the mutation sandbox (design 6.2).
+fn is_safe_vm_name(name: &str) -> bool {
+    name.starts_with(SAFE_PREFIX)
 }
 
 #[test]
@@ -85,7 +125,6 @@ fn an_unknown_vm_id_is_not_found() {
 #[test]
 #[ignore = "requires a Windows host with Hyper-V"]
 fn list_checkpoints_returns_a_list_for_an_existing_vm() {
-    use hypervctl_core::VmId;
     let mut backend = must_connect(backend());
     let listed = backend.list_vms().expect("list_vms");
     let first = listed.first().expect("at least one VM");
@@ -111,4 +150,197 @@ fn list_switches_reads_the_inventory() {
         assert!(!switch.name.is_empty());
         let _ = switch.kind;
     }
+}
+
+/// Waits until `id` reaches `goal`, or fails with the last observed state.
+fn wait_for_state(backend: &mut WmiBackend, id: VmId, goal: VmState) {
+    for _ in 0..60 {
+        let state = backend.get_vm(id).expect("get_vm").summary.state;
+        if state == goal {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    let last = backend.get_vm(id).expect("get_vm").summary.state;
+    panic!("timed out waiting for {goal}; last state was {last}");
+}
+
+#[test]
+#[ignore = "requires a Windows host with Hyper-V"]
+fn the_safety_helper_refuses_a_vm_outside_the_test_prefix() {
+    let mut backend = must_connect(backend());
+    // Pure check: a foreign name is refused, a test-prefixed name is accepted.
+    assert!(!is_safe_vm_name("Windows11"));
+    assert!(!is_safe_vm_name("WS2025"));
+    assert!(is_safe_vm_name("hypervctl-test-debian"));
+    assert!(is_safe_vm_name("hypervctl-test-anything"));
+
+    // On this host, prove the guard against a real VM when one exists.
+    let listed = backend.list_vms().expect("list_vms");
+    if let Some(foreign) = listed
+        .iter()
+        .find(|vm| !is_safe_vm_name(&vm.name))
+        .map(|vm| vm.id)
+    {
+        // The helper panics for this id; we only prove the lookup finds it.
+        let detail = backend.get_vm(foreign).expect("get_vm");
+        assert!(!is_safe_vm_name(&detail.summary.name));
+    }
+    let safe = must_find_test_vm(&mut backend);
+    assert_safe_vm(&mut backend, safe);
+}
+
+#[test]
+#[ignore = "requires a Windows host with Hyper-V"]
+fn power_operations_start_and_turn_off_a_test_vm() {
+    let _guard = mutation_lock();
+    let mut backend = must_connect(backend());
+    let id = must_find_test_vm(&mut backend);
+    assert_safe_vm(&mut backend, id);
+
+    // Bring the VM to a known starting point regardless of prior state.
+    let initial = backend.get_vm(id).expect("get_vm").summary.state;
+    if initial != VmState::Off {
+        let off = backend
+            .request_vm_state(id, RequestedState::TurnOff)
+            .expect("turn off");
+        assert!(
+            matches!(
+                off,
+                hypervctl_core::Pending::Job(_) | hypervctl_core::Pending::Done
+            ),
+            "turn off should be Job or Done, got {off:?}"
+        );
+        wait_for_state(&mut backend, id, VmState::Off);
+    }
+
+    // Off → Start → Running → TurnOff → Off. Each step must accept the
+    // request (Pending::Job or Done); completion is EnabledState polling.
+    let start = backend
+        .request_vm_state(id, RequestedState::Start)
+        .expect("start");
+    assert!(
+        matches!(
+            start,
+            hypervctl_core::Pending::Job(_) | hypervctl_core::Pending::Done
+        ),
+        "start should be Job or Done, got {start:?}"
+    );
+    wait_for_state(&mut backend, id, VmState::Running);
+
+    let off = backend
+        .request_vm_state(id, RequestedState::TurnOff)
+        .expect("turn off");
+    assert!(
+        matches!(
+            off,
+            hypervctl_core::Pending::Job(_) | hypervctl_core::Pending::Done
+        ),
+        "turn off should be Job or Done, got {off:?}"
+    );
+    wait_for_state(&mut backend, id, VmState::Off);
+}
+
+#[test]
+#[ignore = "requires a Windows host with Hyper-V"]
+fn checkpoint_create_list_and_remove_round_trip() {
+    let _guard = mutation_lock();
+    let mut backend = must_connect(backend());
+    let id = must_find_test_vm(&mut backend);
+    assert_safe_vm(&mut backend, id);
+
+    // Ensure Off so CreateSnapshot is legal and the test is deterministic.
+    let initial = backend.get_vm(id).expect("get_vm").summary.state;
+    if initial != VmState::Off {
+        let off = backend
+            .request_vm_state(id, RequestedState::TurnOff)
+            .expect("turn off");
+        assert!(
+            matches!(
+                off,
+                hypervctl_core::Pending::Job(_) | hypervctl_core::Pending::Done
+            ),
+            "turn off should be Job or Done, got {off:?}"
+        );
+        wait_for_state(&mut backend, id, VmState::Off);
+    }
+
+    let before = backend.list_checkpoints(id).expect("list_checkpoints");
+    let created = backend
+        .create_checkpoint(id, None)
+        .expect("create_checkpoint");
+    let job = match created {
+        hypervctl_core::Pending::Job(job) => job,
+        other => panic!("CreateSnapshot should start a job, got {other:?}"),
+    };
+
+    // Poll the job until it finishes (M0 item 6: JobState 7=Completed).
+    for _ in 0..120 {
+        let status = backend.job_status(job.clone()).expect("job_status");
+        if status.is_finished() {
+            match status {
+                hypervctl_core::JobStatus::Succeeded => break,
+                hypervctl_core::JobStatus::Failed { code, message } => {
+                    panic!("checkpoint job failed: {code} {message}");
+                }
+                other => panic!("checkpoint job ended as {other:?}"),
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    let after = backend.list_checkpoints(id).expect("list_checkpoints");
+    assert_eq!(
+        after.len(),
+        before.len() + 1,
+        "one checkpoint should have been created"
+    );
+    let fresh = after.last().expect("the new checkpoint");
+
+    // Remove the checkpoint we just created.
+    let removed = backend
+        .remove_checkpoint(fresh.id)
+        .expect("remove_checkpoint");
+    let job = match removed {
+        hypervctl_core::Pending::Job(job) => job,
+        other => panic!("DestroySnapshot should start a job, got {other:?}"),
+    };
+    for _ in 0..120 {
+        let status = backend.job_status(job.clone()).expect("job_status");
+        if status.is_finished() {
+            match status {
+                hypervctl_core::JobStatus::Succeeded => break,
+                hypervctl_core::JobStatus::Failed { code, message } => {
+                    panic!("destroy job failed: {code} {message}");
+                }
+                other => panic!("destroy job ended as {other:?}"),
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    let final_list = backend.list_checkpoints(id).expect("list_checkpoints");
+    assert_eq!(
+        final_list.len(),
+        before.len(),
+        "the checkpoint should have been removed"
+    );
+}
+
+#[test]
+#[ignore = "requires a Windows host with Hyper-V"]
+fn job_status_reports_unknown_jobs_as_backend_errors() {
+    let mut backend = must_connect(backend());
+    use hypervctl_core::JobRef;
+    let error = backend
+        .job_status(JobRef::from("Microsoft:not-a-real-job"))
+        .expect_err("must fail");
+    // Either NotFound or a backend error; never a panic.
+    assert!(
+        matches!(
+            error,
+            HyperVError::NotFound { .. } | HyperVError::Backend { .. }
+        ),
+        "expected NotFound or Backend, got: {error}"
+    );
 }

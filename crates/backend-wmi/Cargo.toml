@@ -11,6 +11,7 @@ uuid.workspace = true
 hypervctl-core.workspace = true
 serde.workspace = true
 tokio = { workspace = true, features = ["sync"] }
+tracing.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 wmi = "0.18"

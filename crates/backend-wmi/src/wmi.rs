@@ -1,8 +1,10 @@
 //! WMI-backed implementation of the Hyper-V backend (design 3.1, 3.7).
 //!
-//! Read-only operations are implemented in M6; mutations and event subscriptions
-//! arrive with M7. The connection is created on the actor thread because WMI
-//! objects are not `Send` (design 3.2).
+//! Reads and mutations both live here. Mutations follow M0's measured
+//! patterns: `RequestStateChange` for power, `Msvm_VirtualSystemSnapshotService`
+//! for checkpoints, and out-params as `HashMap<String, Variant>`. The
+//! connection is created on the actor thread because WMI objects are not
+//! `Send` (design 3.2).
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -15,7 +17,7 @@ use hypervctl_core::{
 };
 use serde::Deserialize;
 use tokio::sync::mpsc;
-use wmi::WMIConnection;
+use wmi::{IWbemClassWrapper, Variant, WMIConnection};
 
 use crate::error::classify_hresult;
 
@@ -105,6 +107,19 @@ struct SwitchRow {
     element_name: String,
 }
 
+/// A row of `Msvm_ConcreteJob` for [`HyperV::job_status`].
+#[derive(Debug, Deserialize)]
+struct JobRow {
+    #[serde(rename = "JobState")]
+    job_state: u32,
+    #[serde(rename = "ErrorCode")]
+    error_code: Option<u32>,
+    #[serde(rename = "PercentComplete")]
+    percent_complete: Option<u32>,
+    #[serde(rename = "ErrorDescription")]
+    error_description: Option<String>,
+}
+
 /// A row of `Msvm_DiskDrive` (one attached virtual disk).
 #[derive(Debug, Deserialize)]
 struct DiskDriveRow {
@@ -145,6 +160,14 @@ impl WmiBackend {
             State::Unavailable(error) => return Err(error.clone()),
         };
         con.raw_query(wql).map_err(map_wmi_error)
+    }
+
+    /// Borrows the live connection, or replays the remembered failure.
+    fn connected(&mut self) -> Result<&WMIConnection, HyperVError> {
+        match &self.state {
+            State::Connected(con) => Ok(con),
+            State::Unavailable(error) => Err(error.clone()),
+        }
     }
 
     fn summary_rows(&mut self) -> Result<Vec<SummaryRow>, HyperVError> {
@@ -287,7 +310,7 @@ fn days_from_civil(y: u32, m: u32, d: u32) -> i64 {
 /// the GUID; never obtained by projecting `__Path`).
 fn vm_object_path(id: VmId) -> String {
     format!(
-        "\\\\.\\{NAMESPACE}:Msvm_ComputerSystem.CreationClassName=\"Msvm_ComputerSystem\",Name=\"{{{id}}}\""
+        "\\\\.\\{NAMESPACE}:Msvm_ComputerSystem.CreationClassName=\"Msvm_ComputerSystem\",Name=\"{id}\""
     )
 }
 
@@ -313,11 +336,154 @@ fn switch_kind(_raw: Option<u32>) -> SwitchKind {
     SwitchKind::Unknown(0)
 }
 
-/// Not implemented until M7; keeps the trait complete without lying about success.
-fn mutation_not_yet(name: &str) -> HyperVError {
-    HyperVError::backend(RawError::new(format!(
-        "{name} is not available yet; the WMI backend implements reads only (M6)"
-    )))
+/// CIM `uint16` values accepted by `Msvm_ComputerSystem.RequestStateChange`
+/// (M0 item 5). `Resume` and `Start` share value 2 (Enabled).
+fn requested_state_value(request: RequestedState) -> u16 {
+    match request {
+        RequestedState::Start | RequestedState::Resume => 2,
+        RequestedState::TurnOff => 3,
+        RequestedState::ShutDown => 4,
+        RequestedState::Save => 6,
+        RequestedState::Pause => 9,
+        RequestedState::Reset => 11,
+    }
+}
+
+/// Target `EnabledState` once the request finishes; used for
+/// `Pending::AwaitState` and for idempotency checks upstream.
+fn target_enabled_state(request: RequestedState) -> VmState {
+    match request {
+        RequestedState::Start | RequestedState::Resume | RequestedState::Reset => VmState::Running,
+        RequestedState::ShutDown | RequestedState::TurnOff => VmState::Off,
+        RequestedState::Save => VmState::Saved,
+        RequestedState::Pause => VmState::Paused,
+    }
+}
+
+/// Builds the WMI object path for the snapshot service (M0 item 6: four-key
+/// composite; `SystemName` is the host name).
+fn snapshot_service_path(host: &str) -> String {
+    format!(
+        "\\\\.\\{NAMESPACE}:Msvm_VirtualSystemSnapshotService.CreationClassName=\"Msvm_VirtualSystemSnapshotService\",Name=\"vssnapsvc\",SystemCreationClassName=\"Msvm_ComputerSystem\",SystemName=\"{host}\""
+    )
+}
+
+/// Builds the WMI object path for a VSSD instance (M0 item 6: `InstanceID` is
+/// the sole key of `Msvm_VirtualSystemSettingData`).
+fn vssd_object_path(instance_id: &str) -> String {
+    format!(
+        "\\\\.\\{NAMESPACE}:Msvm_VirtualSystemSettingData.CreationClassName=\"Msvm_VirtualSystemSettingData\",InstanceID=\"{instance_id}\""
+    )
+}
+
+/// `InstanceID` of the VSSD behind a checkpoint id (`Microsoft:<guid>`).
+fn vssd_instance_id(checkpoint: CheckpointId) -> String {
+    format!("Microsoft:{checkpoint}")
+}
+
+/// The host name Hyper-V uses as `SystemName` on service objects.
+fn host_name() -> String {
+    std::env::var("COMPUTERNAME").unwrap_or_else(|_| String::from("localhost"))
+}
+
+/// Reads `ReturnValue` from a method out-params wrapper. Missing or wrong-typed
+/// is reported as a backend error rather than guessed.
+fn return_value(out: &IWbemClassWrapper) -> Result<u32, HyperVError> {
+    match out.get_property("ReturnValue") {
+        Ok(Variant::UI4(value)) => Ok(value),
+        Ok(Variant::UI2(value)) => Ok(u32::from(value)),
+        Ok(other) => Err(HyperVError::backend(RawError::new(format!(
+            "method ReturnValue had unexpected type: {other:?}"
+        )))),
+        Err(error) => Err(map_wmi_error(error)),
+    }
+}
+
+/// Reads the `Job` out-param (an object path string) when Hyper-V started one.
+fn job_path(out: &IWbemClassWrapper) -> Option<String> {
+    match out.get_property("Job") {
+        Ok(Variant::String(path)) if !path.is_empty() => Some(path),
+        Ok(_) => None,
+        Err(_) => None,
+    }
+}
+
+/// Extracts the last quoted value from a WMI object path, which for Hyper-V
+/// job and VSSD paths is the `InstanceID` (M0 item 6: keys end with it).
+fn instance_id_from_path(path: &str) -> Option<String> {
+    let start = path.rfind("=\"")? + 2;
+    let rest = path.get(start..)?;
+    let end = rest.find('"')?;
+    let value = rest.get(..end)?;
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+/// Executes a WMI method with the given properties set on a spawned in-params
+/// instance. Properties that are absent stay absent (M0 item 6: putting an
+/// empty `SnapshotSettings` fails with `0x80041006`).
+fn exec_method_with(
+    con: &WMIConnection,
+    object_path: &str,
+    class_name: &str,
+    method_name: &str,
+    props: &[(&str, Variant)],
+) -> Result<IWbemClassWrapper, HyperVError> {
+    let method_class = con
+        .get_object(class_name)
+        .and_then(|class| class.get_method(method_name))
+        .map_err(map_wmi_error)?
+        .ok_or_else(|| {
+            HyperVError::backend(RawError::new(format!(
+                "WMI class {class_name} has no method {method_name}"
+            )))
+        })?;
+    let in_params = method_class.spawn_instance().map_err(map_wmi_error)?;
+    for (name, value) in props {
+        in_params
+            .put_property(name, value.clone())
+            .map_err(map_wmi_error)?;
+    }
+    con.exec_method(object_path, method_name, Some(&in_params))
+        .map_err(map_wmi_error)?
+        .ok_or_else(|| {
+            HyperVError::backend(RawError::new(format!(
+                "WMI method {method_name} returned no out-params"
+            )))
+        })
+}
+
+/// Maps a `RequestStateChange` / snapshot-method result onto `Pending`.
+/// `0x80004005` is never returned here; `32775` is the "already there" /
+/// "not valid now" answer and becomes `InvalidState` (M0 item 5).
+fn pending_from_method(out: &IWbemClassWrapper, operation: &str) -> Result<Pending, HyperVError> {
+    let rv = return_value(out)?;
+    match rv {
+        0 => Ok(Pending::Done),
+        4096 => match job_path(out) {
+            Some(path) => {
+                let id = instance_id_from_path(&path).unwrap_or(path);
+                Ok(Pending::Job(JobRef::new(id)))
+            }
+            None => Err(HyperVError::backend(RawError::new(format!(
+                "{operation} returned 4096 (job started) but no Job path"
+            )))),
+        },
+        32775 => Err(HyperVError::InvalidState {
+            target: None,
+            state: VmState::Unknown(0),
+            operation: operation.to_string(),
+            raw: Some(RawError::new(
+                "ReturnValue=32775 (state conflict / already in target state)",
+            )),
+        }),
+        other => Err(HyperVError::backend(RawError::new(format!(
+            "{operation} returned unexpected ReturnValue={other}"
+        )))),
+    }
 }
 
 impl HyperV for WmiBackend {
@@ -545,38 +711,144 @@ impl HyperV for WmiBackend {
 
     fn request_vm_state(
         &mut self,
-        _id: VmId,
-        _request: RequestedState,
+        id: VmId,
+        request: RequestedState,
     ) -> Result<Pending, HyperVError> {
-        Err(mutation_not_yet("request_vm_state"))
+        let con = self.connected()?;
+        let path = vm_object_path(id);
+        let state_value = requested_state_value(request);
+        let out = exec_method_with(
+            con,
+            &path,
+            "Msvm_ComputerSystem",
+            "RequestStateChange",
+            &[("RequestedState", Variant::UI2(state_value))],
+        )?;
+        // Guest shutdown has no job when Hyper-V accepts it; the state is the
+        // progress (design 3.1). Other requests return 4096+Job or 0.
+        let pending = pending_from_method(&out, "RequestStateChange")?;
+        if request == RequestedState::ShutDown && matches!(pending, Pending::Job(_)) {
+            return Ok(Pending::AwaitState(id, target_enabled_state(request)));
+        }
+        Ok(pending)
     }
 
-    fn create_checkpoint(
-        &mut self,
-        _vm: VmId,
-        _name: Option<&str>,
-    ) -> Result<Pending, HyperVError> {
-        Err(mutation_not_yet("create_checkpoint"))
+    fn create_checkpoint(&mut self, vm: VmId, _name: Option<&str>) -> Result<Pending, HyperVError> {
+        let con = self.connected()?;
+        let host = host_name();
+        let service = snapshot_service_path(&host);
+        let vm_path = vm_object_path(vm);
+        // SnapshotType=2 is the value M0 measured for a normal checkpoint.
+        // SnapshotSettings must stay absent (M0 item 6: empty string fails).
+        let out = exec_method_with(
+            con,
+            &service,
+            "Msvm_VirtualSystemSnapshotService",
+            "CreateSnapshot",
+            &[
+                ("AffectedSystem", Variant::String(vm_path)),
+                ("SnapshotType", Variant::UI2(2)),
+            ],
+        )?;
+        pending_from_method(&out, "CreateSnapshot")
     }
 
     fn restore_checkpoint(
         &mut self,
-        _vm: VmId,
-        _checkpoint: CheckpointId,
+        vm: VmId,
+        checkpoint: CheckpointId,
     ) -> Result<Pending, HyperVError> {
-        Err(mutation_not_yet("restore_checkpoint"))
+        // ApplySnapshot returns 32775 while the VM is Running (M0 item 6).
+        if let Some(row) = self.summary_row_for(vm)? {
+            let state = VmState::from_enabled_state(row.enabled_state);
+            if state == VmState::Running {
+                return Err(HyperVError::InvalidState {
+                    target: Some(vm),
+                    state,
+                    operation: "restore_checkpoint".to_string(),
+                    raw: None,
+                });
+            }
+        } else {
+            return Err(HyperVError::NotFound {
+                kind: TargetKind::Vm,
+                specified: vm.to_string(),
+                raw: None,
+            });
+        }
+        let con = self.connected()?;
+        let host = host_name();
+        let service = snapshot_service_path(&host);
+        let snapshot_path = vssd_object_path(&vssd_instance_id(checkpoint));
+        let out = exec_method_with(
+            con,
+            &service,
+            "Msvm_VirtualSystemSnapshotService",
+            "ApplySnapshot",
+            &[("Snapshot", Variant::String(snapshot_path))],
+        )?;
+        pending_from_method(&out, "ApplySnapshot")
     }
 
-    fn remove_checkpoint(&mut self, _checkpoint: CheckpointId) -> Result<Pending, HyperVError> {
-        Err(mutation_not_yet("remove_checkpoint"))
+    fn remove_checkpoint(&mut self, checkpoint: CheckpointId) -> Result<Pending, HyperVError> {
+        let con = self.connected()?;
+        let host = host_name();
+        let service = snapshot_service_path(&host);
+        let snapshot_path = vssd_object_path(&vssd_instance_id(checkpoint));
+        let out = exec_method_with(
+            con,
+            &service,
+            "Msvm_VirtualSystemSnapshotService",
+            "DestroySnapshot",
+            &[("AffectedSnapshot", Variant::String(snapshot_path))],
+        )?;
+        pending_from_method(&out, "DestroySnapshot")
     }
 
-    fn job_status(&mut self, _job: JobRef) -> Result<JobStatus, HyperVError> {
-        Err(mutation_not_yet("job_status"))
+    fn job_status(&mut self, job: JobRef) -> Result<JobStatus, HyperVError> {
+        let id = job.as_str();
+        let wql = format!(
+            "SELECT JobState, ErrorCode, PercentComplete, ErrorDescription \
+             FROM Msvm_ConcreteJob WHERE InstanceID = '{id}'"
+        );
+        let rows: Vec<JobRow> = self.run_query(&wql)?;
+        let row = rows
+            .into_iter()
+            .next()
+            .ok_or_else(|| HyperVError::backend(RawError::new(format!("unknown job '{id}'"))))?;
+        // M0 item 6 / design 3.7.6: JobState 7=Completed, 10=Exception.
+        // Message text is localized (Japanese on this host) so only the code
+        // is carried into the error.
+        match row.job_state {
+            7 => Ok(JobStatus::Succeeded),
+            10 => Ok(JobStatus::Failed {
+                code: row.error_code.unwrap_or(0),
+                message: row.error_description.unwrap_or_default(),
+            }),
+            // CIM: 3=Starting, 4=Running, 5=Canceling, 6=Completed with
+            // warnings handled as Succeeded above only when 7.
+            11 | 12 => Ok(JobStatus::Cancelled),
+            _ => Ok(JobStatus::Running(row.percent_complete)),
+        }
     }
 
     fn subscribe_changes(&mut self) -> Result<mpsc::UnboundedReceiver<ChangeEvent>, HyperVError> {
-        Err(mutation_not_yet("subscribe_changes"))
+        // The actor thread holds the main connection; events need their own
+        // connection on their own thread (design 3.4, M0 item 7).
+        let (tx, rx) = mpsc::unbounded_channel();
+        let result = std::thread::Builder::new()
+            .name("hypervctl-wmi-events".to_string())
+            .spawn(move || event_loop(tx));
+        match result {
+            Ok(_handle) => {
+                // The loop runs until the receiver is dropped; the handle is
+                // detached on purpose so the frontend can exit cleanly.
+                Ok(rx)
+            }
+            Err(error) => Err(HyperVError::backend(RawError::new(format!(
+                "could not start the WMI event thread: {error}"
+            )))),
+        }
     }
 }
 
@@ -608,11 +880,210 @@ fn vhd_info_from_path(path: &Path) -> Option<VhdInfo> {
     })
 }
 
-// `vm_object_path` is the only way to address a VM for method calls (M7);
-// keep it compiled and tested from M6 so the shape cannot rot.
-#[allow(dead_code)]
-fn _use_vm_object_path() {
-    let _ = vm_object_path(VmId::new(uuid::Uuid::nil()));
+/// One WMI event that maps onto a [`ChangeEvent`]. The struct names must equal
+/// the WMI class names (M0 item 7).
+#[derive(Debug, Deserialize)]
+#[serde(rename = "__InstanceModificationEvent")]
+struct InstanceModificationEvent {
+    #[serde(rename = "TargetInstance")]
+    target_instance: Option<ComputerSystemTarget>,
+}
+
+/// The `TargetInstance` of a VM state event; only `Name` is needed to know a
+/// VM changed (the frontend re-reads the state itself, design 3.4).
+#[derive(Debug, Deserialize)]
+#[serde(rename = "Msvm_ComputerSystem")]
+struct ComputerSystemTarget {
+    #[serde(rename = "Name")]
+    name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename = "__InstanceCreationEvent")]
+struct InstanceCreationEvent {
+    #[serde(rename = "TargetInstance")]
+    target_instance: Option<VssdTarget>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename = "__InstanceDeletionEvent")]
+struct InstanceDeletionEvent {
+    #[serde(rename = "TargetInstance")]
+    target_instance: Option<VssdTarget>,
+}
+
+/// The `TargetInstance` of a checkpoint create/delete event.
+#[derive(Debug, Deserialize)]
+#[serde(rename = "Msvm_VirtualSystemSettingData")]
+struct VssdTarget {
+    #[serde(rename = "VirtualSystemIdentifier")]
+    virtual_system_identifier: Option<String>,
+}
+
+/// Runs until the receiver is dropped. Each event type gets its own connection
+/// because the notification iterators block (M0 item 7). A failed subscription
+/// is logged and the thread exits; `ChangeWatcher` re-subscribes (design 3.4).
+fn event_loop(tx: mpsc::UnboundedSender<ChangeEvent>) {
+    let mut handles = Vec::new();
+    for kind in [
+        EventKind::VmState,
+        EventKind::CheckpointCreated,
+        EventKind::CheckpointDeleted,
+    ] {
+        let tx = tx.clone();
+        match std::thread::Builder::new()
+            .name(format!("hypervctl-wmi-{kind}"))
+            .spawn(move || event_thread(kind, tx))
+        {
+            Ok(handle) => handles.push(handle),
+            Err(error) => {
+                tracing::warn!("could not start WMI event thread: {error}");
+            }
+        }
+    }
+    // Drop our clone so the channel closes when every subscriber ends.
+    drop(tx);
+    for handle in handles {
+        let _ = handle.join();
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum EventKind {
+    VmState,
+    CheckpointCreated,
+    CheckpointDeleted,
+}
+
+impl EventKind {
+    const fn query(self) -> &'static str {
+        match self {
+            Self::VmState => {
+                "SELECT * FROM __InstanceModificationEvent WITHIN 1 \
+                 WHERE TargetInstance ISA \"Msvm_ComputerSystem\""
+            }
+            Self::CheckpointCreated => {
+                "SELECT * FROM __InstanceCreationEvent WITHIN 1 \
+                 WHERE TargetInstance ISA \"Msvm_VirtualSystemSettingData\""
+            }
+            Self::CheckpointDeleted => {
+                "SELECT * FROM __InstanceDeletionEvent WITHIN 1 \
+                 WHERE TargetInstance ISA \"Msvm_VirtualSystemSettingData\""
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for EventKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::VmState => f.write_str("vm-state"),
+            Self::CheckpointCreated => f.write_str("checkpoint-created"),
+            Self::CheckpointDeleted => f.write_str("checkpoint-deleted"),
+        }
+    }
+}
+
+fn event_thread(kind: EventKind, tx: mpsc::UnboundedSender<ChangeEvent>) {
+    let con = match WMIConnection::with_namespace_path(NAMESPACE) {
+        Ok(con) => con,
+        Err(error) => {
+            tracing::warn!("WMI event thread {kind} could not connect: {error}");
+            return;
+        }
+    };
+    match kind {
+        EventKind::VmState => {
+            let iter = match con.raw_notification::<InstanceModificationEvent>(kind.query()) {
+                Ok(iter) => iter,
+                Err(error) => {
+                    tracing::warn!("WMI event thread {kind} could not subscribe: {error}");
+                    return;
+                }
+            };
+            for event in iter {
+                match event {
+                    Ok(event) => {
+                        // Any VM modification is a signal; the name only
+                        // proves the event was for a real VM.
+                        if event
+                            .target_instance
+                            .as_ref()
+                            .and_then(|t| t.name.as_ref())
+                            .is_some_and(|n| !n.is_empty())
+                            && tx.send(ChangeEvent::Vms).is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!("WMI event thread {kind} stream error: {error}");
+                        break;
+                    }
+                }
+            }
+        }
+        EventKind::CheckpointCreated => {
+            let iter = match con.raw_notification::<InstanceCreationEvent>(kind.query()) {
+                Ok(iter) => iter,
+                Err(error) => {
+                    tracing::warn!("WMI event thread {kind} could not subscribe: {error}");
+                    return;
+                }
+            };
+            for event in iter {
+                match event {
+                    Ok(event) => {
+                        let vm = event
+                            .target_instance
+                            .as_ref()
+                            .and_then(|t| t.virtual_system_identifier.as_deref())
+                            .and_then(|id| id.parse::<uuid::Uuid>().ok())
+                            .map(VmId::new);
+                        if let Some(vm) = vm {
+                            if tx.send(ChangeEvent::Checkpoints(vm)).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!("WMI event thread {kind} stream error: {error}");
+                        break;
+                    }
+                }
+            }
+        }
+        EventKind::CheckpointDeleted => {
+            let iter = match con.raw_notification::<InstanceDeletionEvent>(kind.query()) {
+                Ok(iter) => iter,
+                Err(error) => {
+                    tracing::warn!("WMI event thread {kind} could not subscribe: {error}");
+                    return;
+                }
+            };
+            for event in iter {
+                match event {
+                    Ok(event) => {
+                        let vm = event
+                            .target_instance
+                            .as_ref()
+                            .and_then(|t| t.virtual_system_identifier.as_deref())
+                            .and_then(|id| id.parse::<uuid::Uuid>().ok())
+                            .map(VmId::new);
+                        if let Some(vm) = vm {
+                            if tx.send(ChangeEvent::Checkpoints(vm)).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!("WMI event thread {kind} stream error: {error}");
+                        break;
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -767,21 +1238,73 @@ mod tests {
         let id = VmId::new(uuid::Uuid::nil());
         let path = vm_object_path(id);
         assert!(path.contains(r#"CreationClassName="Msvm_ComputerSystem""#));
-        assert!(path.contains(r#"Name="{00000000-0000-0000-0000-000000000000}""#));
+        assert!(path.contains(r#"Name="00000000-0000-0000-0000-000000000000""#));
     }
 
     #[test]
-    fn mutations_are_refused_until_m7() {
-        let mut backend = WmiBackend::connect_or_unavailable();
-        let id = VmId::new(uuid::Uuid::nil());
-        let error = backend
-            .request_vm_state(id, RequestedState::Start)
-            .expect_err("must refuse");
-        assert_eq!(error.kind(), "backend");
-        assert!(error
-            .raw()
-            .map(|raw| raw.message.contains("not available yet"))
-            .unwrap_or(false));
+    fn requested_state_values_follow_the_m0_table() {
+        assert_eq!(requested_state_value(RequestedState::Start), 2);
+        assert_eq!(requested_state_value(RequestedState::Resume), 2);
+        assert_eq!(requested_state_value(RequestedState::TurnOff), 3);
+        assert_eq!(requested_state_value(RequestedState::ShutDown), 4);
+        assert_eq!(requested_state_value(RequestedState::Save), 6);
+        assert_eq!(requested_state_value(RequestedState::Pause), 9);
+        assert_eq!(requested_state_value(RequestedState::Reset), 11);
+    }
+
+    #[test]
+    fn target_states_match_the_request() {
+        assert_eq!(
+            target_enabled_state(RequestedState::Start),
+            VmState::Running
+        );
+        assert_eq!(
+            target_enabled_state(RequestedState::Resume),
+            VmState::Running
+        );
+        assert_eq!(
+            target_enabled_state(RequestedState::Reset),
+            VmState::Running
+        );
+        assert_eq!(target_enabled_state(RequestedState::ShutDown), VmState::Off);
+        assert_eq!(target_enabled_state(RequestedState::TurnOff), VmState::Off);
+        assert_eq!(target_enabled_state(RequestedState::Save), VmState::Saved);
+        assert_eq!(target_enabled_state(RequestedState::Pause), VmState::Paused);
+    }
+
+    #[test]
+    fn the_snapshot_service_path_has_all_four_keys() {
+        let path = snapshot_service_path("WIN11");
+        assert!(path.contains(r#"CreationClassName="Msvm_VirtualSystemSnapshotService""#));
+        assert!(path.contains(r#"Name="vssnapsvc""#));
+        assert!(path.contains(r#"SystemCreationClassName="Msvm_ComputerSystem""#));
+        assert!(path.contains(r#"SystemName="WIN11""#));
+    }
+
+    #[test]
+    fn the_vssd_path_uses_the_instance_id() {
+        let path = vssd_object_path("Microsoft:4D679572-6FAC-464D-8CA4-B960A1AC66CA");
+        assert!(path.contains(r#"CreationClassName="Msvm_VirtualSystemSettingData""#));
+        assert!(path.contains(r#"InstanceID="Microsoft:4D679572-6FAC-464D-8CA4-B960A1AC66CA""#));
+    }
+
+    #[test]
+    fn instance_ids_are_extracted_from_object_paths() {
+        let path = "\\\\.\\root\\virtualization\\v2:Msvm_ConcreteJob.CreationClassName=\"Msvm_ConcreteJob\",InstanceID=\"Microsoft:abc-123\"";
+        assert_eq!(
+            instance_id_from_path(path).as_deref(),
+            Some("Microsoft:abc-123")
+        );
+        assert_eq!(instance_id_from_path("no-colon"), None);
+    }
+
+    #[test]
+    fn vssd_instance_ids_round_trip_through_checkpoint_ids() {
+        let id = CheckpointId::new(uuid::Uuid::nil());
+        let instance = vssd_instance_id(id);
+        assert_eq!(instance, "Microsoft:00000000-0000-0000-0000-000000000000");
+        let parsed = checkpoint_id_from_instance(&instance);
+        assert_eq!(parsed, Some(id));
     }
 
     #[test]
@@ -791,6 +1314,10 @@ mod tests {
         let mut backend = WmiBackend::connect_or_unavailable();
         if matches!(backend.state, State::Unavailable(_)) {
             let error = backend.list_vms().expect_err("must fail");
+            assert_eq!(error.kind(), "hyper_v_unavailable");
+            let error = backend
+                .request_vm_state(VmId::new(uuid::Uuid::nil()), RequestedState::Start)
+                .expect_err("must fail");
             assert_eq!(error.kind(), "hyper_v_unavailable");
         }
     }
