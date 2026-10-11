@@ -687,7 +687,7 @@ mod tests {
     use std::time::Duration;
 
     use crossterm::event::{KeyCode, KeyModifiers};
-    use hypervctl_core::{Checkpoint, CheckpointId, CheckpointKind};
+    use hypervctl_core::{Checkpoint, CheckpointId, CheckpointKind, MemoryConfig};
     use uuid::Uuid;
 
     use super::*;
@@ -1000,5 +1000,98 @@ mod tests {
         );
         let _ = reduce(&mut state, Action::MenuSelect);
         assert!(matches!(state.overlay, Overlay::Confirm(_)));
+    }
+
+    fn detail_of(vm: &VmSummary) -> VmDetail {
+        VmDetail {
+            summary: vm.clone(),
+            processor_count: 2,
+            memory: MemoryConfig {
+                startup_bytes: 2 * 1024 * 1024 * 1024,
+                dynamic_enabled: true,
+                min_bytes: None,
+                max_bytes: None,
+            },
+            disks: Vec::new(),
+            nics: Vec::new(),
+            checkpoint_count: 0,
+            config_path: String::new(),
+            integration_services: Vec::new(),
+            notes: None,
+        }
+    }
+
+    #[test]
+    fn a_late_detail_of_another_vm_is_dropped() {
+        // Acceptance 10: a slow answer must not repaint the pane of the VM
+        // that is on screen now.
+        let mut state = sample_state();
+        let web01 = VmId::new(Uuid::from_u128(1 << 96));
+        let web02 = VmId::new(Uuid::from_u128(2 << 96));
+        assert_eq!(state.vm_list.selected, Some(web01));
+        let late = state
+            .vm_list
+            .items
+            .iter()
+            .find(|vm| vm.id == web02)
+            .cloned()
+            .unwrap_or_else(|| panic!("the fixture must contain web-02"));
+        let _ = reduce(
+            &mut state,
+            Action::VmDetailLoaded {
+                id: web02,
+                result: Box::new(Ok(detail_of(&late))),
+            },
+        );
+        assert!(state.detail.detail.is_none());
+        let wanted = state
+            .vm_list
+            .items
+            .iter()
+            .find(|vm| vm.id == web01)
+            .cloned()
+            .unwrap_or_else(|| panic!("the fixture must contain web-01"));
+        let _ = reduce(
+            &mut state,
+            Action::VmDetailLoaded {
+                id: web01,
+                result: Box::new(Ok(detail_of(&wanted))),
+            },
+        );
+        assert_eq!(
+            state.detail.detail.as_ref().map(|detail| detail.summary.id),
+            Some(web01)
+        );
+    }
+
+    #[test]
+    fn a_tick_during_a_fetch_starts_no_second_one() {
+        // Acceptance 11: ticks while a fetch is running neither stack up
+        // fetches nor lose the fact that the list is behind.
+        let mut state = sample_state();
+        let first = reduce(&mut state, Action::RefreshTick);
+        assert_eq!(first, vec![Effect::FetchVmList]);
+        assert!(state.vm_list.refresh_in_flight);
+        let second = reduce(&mut state, Action::RefreshTick);
+        assert!(second.is_empty());
+        let third = reduce(&mut state, Action::RefreshTick);
+        assert!(third.is_empty());
+        // A change announcement during the fetch is remembered, not doubled.
+        let announced = reduce(&mut state, Action::BackendChanged);
+        assert!(announced.is_empty());
+        assert!(state.vm_list.refresh_again);
+        // When the fetch lands, exactly one catch-up fetch starts.
+        let items = state.vm_list.items.clone();
+        let loaded = reduce(&mut state, Action::VmListLoaded(Box::new(Ok(items))));
+        assert!(
+            loaded
+                .iter()
+                .filter(|effect| **effect == Effect::FetchVmList)
+                .count()
+                == 1,
+            "exactly one catch-up fetch, got {loaded:?}"
+        );
+        assert!(!state.vm_list.refresh_again);
+        assert!(state.vm_list.refresh_in_flight);
     }
 }
