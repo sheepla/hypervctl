@@ -10,6 +10,8 @@ use clap::Parser;
 use tracing_subscriber::filter::LevelFilter;
 
 use hypervctl_backend_mock::MockBackend;
+#[cfg(windows)]
+use hypervctl_backend_wmi::WmiBackend;
 use hypervctl_core::{BackendActor, HyperVError, Operations, RawError};
 
 use crate::cli::args::Cli;
@@ -38,18 +40,20 @@ fn main() -> ExitCode {
 
     let context = Context::new(&cli.global, &opts);
     let outcome = runtime.block_on(async {
-        match ensure_backend()? {
-            BackendChoice::Mock => {
-                let ops = Operations::new(BackendActor::spawn(MockBackend::with_fixture));
-                // Ctrl+C stops the waiting, not the work: what the backend has
-                // accepted keeps running there (design 4.2).
-                tokio::select! {
-                    result = cli::commands::run(&cli.resource, &ops, &context) => result,
-                    interrupted = tokio::signal::ctrl_c() => {
-                        let _ = interrupted;
-                        Err(CliError::Interrupted)
-                    }
-                }
+        let ops = match ensure_backend()? {
+            BackendChoice::Mock => Operations::new(BackendActor::spawn(MockBackend::with_fixture)),
+            #[cfg(windows)]
+            BackendChoice::Wmi => {
+                Operations::new(BackendActor::spawn(WmiBackend::connect_or_unavailable))
+            }
+        };
+        // Ctrl+C stops the waiting, not the work: what the backend has
+        // accepted keeps running there (design 4.2).
+        tokio::select! {
+            result = cli::commands::run(&cli.resource, &ops, &context) => result,
+            interrupted = tokio::signal::ctrl_c() => {
+                let _ = interrupted;
+                Err(CliError::Interrupted)
             }
         }
     });
@@ -69,11 +73,12 @@ fn main() -> ExitCode {
     }
 }
 
-/// Which backend to start. The WMI backend is not built yet, so Windows asks
-/// for the mock explicitly instead of failing halfway through a command
-/// (design 1.2).
+/// Which backend to start. The WMI backend exists on Windows only; elsewhere
+/// the CLI falls back to the mock and says so (design 1.2).
 enum BackendChoice {
     Mock,
+    #[cfg(windows)]
+    Wmi,
 }
 
 fn ensure_backend() -> Result<BackendChoice, CliError> {
@@ -85,11 +90,12 @@ fn ensure_backend() -> Result<BackendChoice, CliError> {
         // No value and `wmi` mean the real backend: only non-Windows may fall
         // back to the mock, and even there the difference is reported.
         "" | "wmi" => {
-            if cfg!(windows) {
-                Err(CliError::Backend(HyperVError::backend(RawError::new(
-                    "the WMI backend is not available yet; set HYPERVCTL_BACKEND=mock",
-                ))))
-            } else {
+            #[cfg(windows)]
+            {
+                Ok(BackendChoice::Wmi)
+            }
+            #[cfg(not(windows))]
+            {
                 Ok(BackendChoice::Mock)
             }
         }

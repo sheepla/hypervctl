@@ -9,3 +9,11 @@ publish = false
 thiserror.workspace = true
 uuid.workspace = true
 hypervctl-core.workspace = true
+serde.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+
+[target.'cfg(windows)'.dependencies]
+wmi = "0.18"
+
+[dev-dependencies]
+uuid.workspace = true

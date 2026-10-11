@@ -212,14 +212,27 @@ fn a_name_is_never_silently_guessed() {
 
 #[cfg(windows)]
 #[test]
-fn the_real_backend_is_refused_until_it_is_implemented() {
+fn the_wmi_backend_is_accepted_and_classifies_connection_failures() {
+    // M6 wired the real backend: it must not say "not available yet". On a
+    // host with Hyper-V the command succeeds; without it the error is the
+    // classified HyperVUnavailable, never a raw panic.
     let output = run_with_backend(&["vm", "list"], "wmi");
-    assert_eq!(status(&output), 1);
-    assert!(stdout(&output).is_empty(), "{}", stdout(&output));
+    let code = status(&output);
     let err = stderr(&output);
-    assert!(err.contains("error: backend error:"), "{err:?}");
-    assert!(err.contains("HYPERVCTL_BACKEND=mock"), "{err:?}");
-    assert!(err.contains("hint:"), "{err:?}");
+    assert!(
+        code == 0 || code == 1,
+        "unexpected exit code {code}: {err:?}"
+    );
+    assert!(
+        !err.contains("not available yet"),
+        "the WMI backend is implemented: {err:?}"
+    );
+    if code != 0 {
+        assert!(
+            err.contains("error:") && (err.contains("unavailable") || err.contains("backend")),
+            "{err:?}"
+        );
+    }
 }
 
 #[test]
