@@ -11,9 +11,9 @@ use std::time::Duration;
 
 use hypervctl_core::{
     AttachedVhd, ChangeEvent, Checkpoint, CheckpointId, CheckpointKind, Controller, ControllerKind,
-    HyperV, HyperVError, JobRef, JobStatus, MemoryConfig, Pending, RawError, RequestedState,
-    SwitchDetail, SwitchId, SwitchKind, SwitchSummary, TargetKind, VhdAttachment, VhdFormat,
-    VhdInfo, VhdKind, VlanMode, VlanSettings, VmDetail, VmId, VmState, VmSummary,
+    HyperV, HyperVError, JobRef, JobStatus, MemoryConfig, NicConfig, Pending, RawError,
+    RequestedState, SwitchDetail, SwitchId, SwitchKind, SwitchSummary, TargetKind, VhdAttachment,
+    VhdFormat, VhdInfo, VhdKind, VlanMode, VlanSettings, VmDetail, VmId, VmState, VmSummary,
 };
 use serde::Deserialize;
 use tokio::sync::mpsc;
@@ -139,6 +139,26 @@ struct ControllerRasdRow {
     resource_type: Option<u16>,
 }
 
+/// A row of `Msvm_SyntheticEthernetPortSettingData` (NIC MAC address).
+/// `InstanceID` is `Microsoft:{vm-guid}\{nic-guid}`.
+#[derive(Debug, Deserialize)]
+struct SespdRow {
+    #[serde(rename = "InstanceID")]
+    instance_id: String,
+    #[serde(rename = "Address")]
+    address: Option<String>,
+}
+
+/// A row of `Msvm_EthernetPortAllocationSettingData` (NIC switch connection).
+/// `InstanceID` is `Microsoft:{vm-guid}\{nic-guid}\C`.
+#[derive(Debug, Deserialize)]
+struct EpasdRow {
+    #[serde(rename = "InstanceID")]
+    instance_id: String,
+    #[serde(rename = "LastKnownSwitchName")]
+    last_known_switch_name: Option<String>,
+}
+
 impl WmiBackend {
     /// Opens a connection to `root\virtualization\v2`. Never panics: a failure
     /// is remembered and returned from every subsequent call.
@@ -215,6 +235,55 @@ impl WmiBackend {
                 .as_deref()
                 .is_some_and(|t| t == "Microsoft:Hyper-V:Realized")
         })
+    }
+
+    /// NICs of a VM: MAC from SESPD, switch name from EPASD. Both share the
+    /// InstanceID prefix `Microsoft:{vm-guid}\{nic-guid}`.
+    fn nics_for_vm(&mut self, id: VmId) -> Result<Vec<NicConfig>, HyperVError> {
+        // WQL treats `\` as an escape; `\\\\` in Rust becomes `\\` in the query,
+        // which WQL reads as a literal backslash.
+        let sespd: Vec<SespdRow> = self.run_query(&format!(
+            "SELECT InstanceID, Address FROM Msvm_SyntheticEthernetPortSettingData \
+             WHERE InstanceID LIKE 'Microsoft:{id}\\\\%'"
+        ))?;
+        let epasd: Vec<EpasdRow> = self.run_query(&format!(
+            "SELECT InstanceID, LastKnownSwitchName FROM Msvm_EthernetPortAllocationSettingData \
+             WHERE InstanceID LIKE 'Microsoft:{id}\\\\%'"
+        ))?;
+        // EPASD InstanceID is `...{nic-guid}\C`; strip the trailing `\C` to join.
+        let switch_map: std::collections::HashMap<String, Option<String>> = epasd
+            .into_iter()
+            .map(|row| {
+                let key = row
+                    .instance_id
+                    .strip_suffix("\\C")
+                    .unwrap_or(&row.instance_id)
+                    .to_string();
+                (key, row.last_known_switch_name.filter(|s| !s.is_empty()))
+            })
+            .collect();
+        Ok(sespd
+            .into_iter()
+            .map(|row| NicConfig {
+                switch_name: switch_map.get(&row.instance_id).cloned().flatten(),
+                // Hyper-V reports MAC as bare hex; insert colons for display.
+                mac_address: row.address.filter(|a| !a.is_empty()).map(|a| {
+                    a.as_bytes()
+                        .chunks(2)
+                        .map(|pair| {
+                            format!(
+                                "{:02X}",
+                                u8::from_str_radix(std::str::from_utf8(pair).unwrap_or("00"), 16)
+                                    .unwrap_or(0)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(":")
+                }),
+                // IP addresses require guest integration; not available via WMI.
+                ip_addresses: Vec::new(),
+            })
+            .collect())
     }
 }
 
@@ -571,8 +640,9 @@ impl HyperV for WmiBackend {
             .into_iter()
             .map(|attached| attached.attachment)
             .collect();
-        // NICs and integration services need association walks that are not
-        // yet implemented; the defaults keep the type honest (empty).
+        let nics = self.nics_for_vm(id)?;
+        // Integration services need a class that is not registered on all
+        // hosts; the default keeps the type honest (empty).
         let memory = MemoryConfig {
             startup_bytes: summary.memory_assigned_bytes.unwrap_or(0),
             dynamic_enabled: false,
@@ -584,7 +654,7 @@ impl HyperV for WmiBackend {
             processor_count: u32::from(processor_count),
             memory,
             disks,
-            nics: Vec::new(),
+            nics,
             checkpoint_count,
             config_path,
             integration_services: Vec::new(),
