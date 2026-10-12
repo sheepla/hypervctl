@@ -707,7 +707,7 @@ impl HyperV for WmiBackend {
     fn list_switches(&mut self) -> Result<Vec<SwitchSummary>, HyperVError> {
         // `SwitchType` is not a WMI property on this class; only identity is.
         let rows: Vec<SwitchRow> = match self
-            .run_query("SELECT Name, ElementName FROM Msvm_VirtualSwitch")
+            .run_query("SELECT Name, ElementName FROM Msvm_VirtualEthernetSwitch")
         {
             Ok(rows) => rows,
             // Some hosts do not register the class until a switch exists.
@@ -740,7 +740,8 @@ impl HyperV for WmiBackend {
     }
 
     fn get_switch(&mut self, id: SwitchId) -> Result<SwitchDetail, HyperVError> {
-        let wql = format!("SELECT Name, ElementName FROM Msvm_VirtualSwitch WHERE Name = '{id}'");
+        let wql =
+            format!("SELECT Name, ElementName FROM Msvm_VirtualEthernetSwitch WHERE Name = '{id}'");
         let mut rows: Vec<SwitchRow> = self.run_query(&wql)?;
         let row = rows.pop().ok_or_else(|| HyperVError::NotFound {
             kind: TargetKind::Switch,
