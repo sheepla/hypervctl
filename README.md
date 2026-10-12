@@ -5,10 +5,9 @@ application development and testing on a local Hyper-V host: manage virtual
 machines, checkpoints, switches and virtual hard disks without opening
 Hyper-V Manager or memorising PowerShell.
 
-**Status: early.** The CLI and the TUI are feature-complete against a built-in
-mock backend. The real WMI backend for Hyper-V is not implemented yet, so the
-tool cannot drive actual virtual machines (see
-[Limitations](#limitations)).
+**Status: early but working on real hardware.** The CLI and the TUI run
+against a real Hyper-V host through WMI on Windows. A mock backend is bundled
+for development and for trying the tool on machines without Hyper-V.
 
 ## Install
 
@@ -64,9 +63,9 @@ hypervctl checkpoint create web-01 --name before-upgrade
 hypervctl checkpoint restore web-01 before-upgrade
 hypervctl checkpoint remove web-01 before-upgrade
 
-# Switches and virtual hard disks (read-only for now)
+# Switches and virtual hard disks
 hypervctl switch list
-hypervctl switch get test-external
+hypervctl switch get 'Default Switch'
 hypervctl vhd list --vm web-01
 hypervctl vhd get 'C:\HyperV\web-01\disk.vhdx'
 
@@ -74,8 +73,8 @@ hypervctl vhd get 'C:\HyperV\web-01\disk.vhdx'
 hypervctl tui
 ```
 
-Until the real backend exists, try any of the above against the bundled demo
-data with `HYPERVCTL_BACKEND=mock` (PowerShell):
+To try the tool without a Hyper-V host, or to develop against demo data, set
+`HYPERVCTL_BACKEND=mock` (PowerShell):
 
 ```powershell
 $env:HYPERVCTL_BACKEND = "mock"
@@ -155,15 +154,18 @@ Keys (full list under `?` inside the TUI): `j`/`k` or arrow keys move,
 
 ## Limitations
 
-- **No real Hyper-V backend yet.** Only `HYPERVCTL_BACKEND=mock` works. The
-  WMI implementation is planned; until then every command and the TUI run
-  against built-in demo data and change nothing on the host.
 - Windows only for the real backend. On other platforms the mock backend is
   used automatically so the tool can be tried anywhere.
 - Local hosts only: remote Hyper-V connections are out of scope.
 - MVP scope: VMs (list, detail, power, checkpoints), virtual switches
   (read-only), attached VHDs (read-only). Creating or deleting VMs, NIC/disk
   attachment, live migration, replication and GPU support are not included.
+- Switch type (Public / Private / Internal) is shown as `Unknown(0)` because
+  Hyper-V does not expose it through a single WMI property.
+- `vm restart` waits for a graceful guest shutdown followed by a start. If
+  the guest OS does not respond to the shutdown request (e.g. integration
+  services are not running), the command times out; use `vm restart --force`
+  instead.
 - The `shell` interactive mode from the original requirements is not
   implemented.
 
@@ -177,7 +179,14 @@ cargo test --workspace
 
 CI runs the same checks on Linux and a build plus tests on Windows. Tests
 never touch a real Hyper-V host; the WMI backend's hardware-in-the-loop tests
-are excluded from CI.
+are excluded from CI and can be run manually on a Hyper-V host:
+
+```console
+cargo test -p hypervctl-backend-wmi --test real_machine -- --ignored
+```
+
+The hardware tests only mutate virtual machines whose names start with
+`hypervctl-test-`. They are skipped if no such VM exists.
 
 Golden output files can be regenerated with
 `HYPERVCTL_BLESS=1 cargo test -p hypervctl golden` (and the equivalent for the
