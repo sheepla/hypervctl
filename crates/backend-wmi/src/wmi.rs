@@ -1010,10 +1010,9 @@ impl HyperV for WmiBackend {
     }
 }
 
-/// Reads the file size from the filesystem. A missing or unreadable file
-/// yields `None` (design 3.1: information may be incomplete, the attachment
-/// itself still exists). The virtual size lives in the VHD footer / VHDX
-/// header and is filled in when M7 adds format parsing.
+/// Reads the file size and virtual size from the VHD/VHDX header. A missing
+/// or unreadable file yields `None` (design 3.1: information may be
+/// incomplete, the attachment itself still exists).
 fn vhd_info_from_path(path: &Path) -> Option<VhdInfo> {
     let metadata = std::fs::metadata(path).ok()?;
     let file_size_bytes = metadata.len();
@@ -1026,16 +1025,177 @@ fn vhd_info_from_path(path: &Path) -> Option<VhdInfo> {
         Some("vhdx") => VhdFormat::Vhdx,
         _ => return None,
     };
+    let virtual_size_bytes = match format {
+        VhdFormat::Vhd => read_vhd_virtual_size(path).unwrap_or(file_size_bytes),
+        VhdFormat::Vhdx => read_vhdx_virtual_size(path).unwrap_or(file_size_bytes),
+        VhdFormat::Unknown(_) => file_size_bytes,
+    };
+    let (kind, parent_path) = match format {
+        VhdFormat::Vhd => read_vhd_footer(path)
+            .map(|f| (f.kind, f.parent_path))
+            .unwrap_or((VhdKind::Unknown(0), None)),
+        _ => (VhdKind::Unknown(0), None),
+    };
     Some(VhdInfo {
         path: path.to_path_buf(),
         format,
-        kind: VhdKind::Unknown(0),
-        virtual_size_bytes: file_size_bytes,
+        kind,
+        virtual_size_bytes,
         file_size_bytes,
         block_size_bytes: None,
-        parent_path: None,
+        parent_path,
         disk_id: None,
     })
+}
+
+/// VHD footer fields we care about (512 bytes, big-endian numbers).
+struct VhdFooter {
+    kind: VhdKind,
+    virtual_size: u64,
+    parent_path: Option<PathBuf>,
+}
+
+/// Reads the VHD footer. Fixed disks store it at offset 0; dynamic and
+/// differencing disks at `file_size - 512`. Both locations are tried.
+fn read_vhd_footer(path: &Path) -> Option<VhdFooter> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let file_len = file.metadata().ok()?.len();
+    if file_len < 512 {
+        return None;
+    }
+    // Try the end first (dynamic/differencing), then the start (fixed).
+    let mut buf = [0u8; 512];
+    for offset in [file_len.wrapping_sub(512), 0] {
+        if file.seek(SeekFrom::Start(offset)).is_err() {
+            continue;
+        }
+        if file.read_exact(&mut buf).is_err() {
+            continue;
+        }
+        // Cookie at offset 0 must be "conectix".
+        if &buf[0..8] != b"conectix" {
+            continue;
+        }
+        let disk_type = u32::from_be_bytes([buf[60], buf[61], buf[62], buf[63]]);
+        let virtual_size = u64::from_be_bytes([
+            buf[48], buf[49], buf[50], buf[51], buf[52], buf[53], buf[54], buf[55],
+        ]);
+        let kind = match disk_type {
+            2 => VhdKind::Fixed,
+            3 => VhdKind::Dynamic,
+            4 => VhdKind::Differencing,
+            other => VhdKind::Unknown(other as u16),
+        };
+        // Parent locator for differencing disks (offset 64, 8 bytes BE).
+        let parent_path = if disk_type == 4 {
+            let plat_loc_off = u64::from_be_bytes([
+                buf[72], buf[73], buf[74], buf[75], buf[76], buf[77], buf[78], buf[79],
+            ]);
+            if plat_loc_off > 0 && plat_loc_off < file_len {
+                let _ = file.seek(SeekFrom::Start(plat_loc_off));
+                let mut pl = [0u8; 8];
+                if file.read_exact(&mut pl).is_ok() {
+                    let data_off = u64::from_be_bytes(pl) + 8; // skip header
+                    let data_len = u16::from_be_bytes([buf[64], buf[65]]) as u64;
+                    if data_off + data_len <= file_len && data_len > 0 && data_len < 2048 {
+                        let _ = file.seek(SeekFrom::Start(data_off));
+                        let mut raw = vec![0u8; data_len as usize];
+                        if file.read_exact(&mut raw).is_ok() {
+                            // UTF-16LE in practice; fall back to lossy.
+                            let s: String = raw
+                                .chunks(2)
+                                .map(|c| u16::from_le_bytes([c[0], *c.get(1).unwrap_or(&0)]))
+                                .filter_map(|u| char::from_u32(u32::from(u)))
+                                .collect();
+                            if !s.is_empty() {
+                                Some(PathBuf::from(s))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        return Some(VhdFooter {
+            kind,
+            virtual_size,
+            parent_path,
+        });
+    }
+    None
+}
+
+fn read_vhd_virtual_size(path: &Path) -> Option<u64> {
+    read_vhd_footer(path).map(|f| f.virtual_size)
+}
+
+/// VHDX: "vhdxfile" signature at offset 0; VirtualSize lives in the metadata
+/// region (defined by the region table at 0x30000). The VirtualDiskSize item
+/// is at metadata offset 0x10008 (8 bytes LE) on standard Hyper-V VHDX files.
+fn read_vhdx_virtual_size(path: &Path) -> Option<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let file_len = file.metadata().ok()?.len();
+    if file_len < 328 {
+        return None;
+    }
+    // Verify the file signature.
+    file.seek(SeekFrom::Start(0)).ok()?;
+    let mut sig = [0u8; 8];
+    file.read_exact(&mut sig).ok()?;
+    if &sig != b"vhdxfile" {
+        return None;
+    }
+    // The region table is at 0x30000 (after the two 64KB headers).
+    // It contains the metadata region offset.
+    file.seek(SeekFrom::Start(0x30000)).ok()?;
+    let mut region_hdr = [0u8; 16];
+    file.read_exact(&mut region_hdr).ok()?;
+    if &region_hdr[0..4] != b"regi" {
+        return None;
+    }
+    let entry_count =
+        u32::from_le_bytes([region_hdr[8], region_hdr[9], region_hdr[10], region_hdr[11]]);
+    // The metadata region GUID (file bytes): 06 a2 7c 8b 90 47 9a 4b b8 fe 57 5f 05 0f 88 6e
+    const META_GUID: [u8; 16] = [
+        0x06, 0xa2, 0x7c, 0x8b, 0x90, 0x47, 0x9a, 0x4b, 0xb8, 0xfe, 0x57, 0x5f, 0x05, 0x0f, 0x88,
+        0x6e,
+    ];
+    let mut meta_offset = None;
+    for e in 0..entry_count as u64 {
+        file.seek(SeekFrom::Start(0x30000 + 16 + e * 32)).ok()?;
+        let mut entry = [0u8; 32];
+        file.read_exact(&mut entry).ok()?;
+        if entry[0..16] == META_GUID {
+            meta_offset = Some(u64::from_le_bytes([
+                entry[16], entry[17], entry[18], entry[19], entry[20], entry[21], entry[22],
+                entry[23],
+            ]));
+            break;
+        }
+    }
+    let meta_base = meta_offset?;
+    // The VirtualDiskSize item is at metadata offset 0x10008 (8 bytes LE).
+    file.seek(SeekFrom::Start(meta_base + 0x10008)).ok()?;
+    let mut buf = [0u8; 8];
+    file.read_exact(&mut buf).ok()?;
+    let size = u64::from_le_bytes(buf);
+    if size == 0 {
+        return None;
+    }
+    Some(size)
 }
 
 /// One WMI event that maps onto a [`ChangeEvent`]. The struct names must equal

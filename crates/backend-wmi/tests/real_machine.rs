@@ -187,6 +187,36 @@ fn list_vhds_reports_attachments_with_controller_slots() {
     }
 }
 
+#[test]
+#[ignore = "requires a Windows host with Hyper-V"]
+fn vhd_info_reports_virtual_size_larger_than_or_equal_to_file_size() {
+    let mut backend = must_connect(backend());
+    let all = backend.list_vhds(None).expect("list_vhds");
+    let with_info: Vec<_> = all.iter().filter(|a| a.info.is_some()).collect();
+    if with_info.is_empty() {
+        // No readable VHD files on this host; nothing to assert.
+        return;
+    }
+    for attached in &with_info {
+        let info = attached.info.as_ref().expect("info");
+        // Virtual size is never smaller than the file size for a valid VHD/VHDX.
+        assert!(
+            info.virtual_size_bytes >= info.file_size_bytes,
+            "virtual size {} < file size {} for {:?}",
+            info.virtual_size_bytes,
+            info.file_size_bytes,
+            info.path
+        );
+        // A real disk is at least 1 MB.
+        assert!(
+            info.virtual_size_bytes >= 1024 * 1024,
+            "virtual size {} is implausibly small for {:?}",
+            info.virtual_size_bytes,
+            info.path
+        );
+    }
+}
+
 /// Waits until `id` reaches `goal`, or fails with the last observed state.
 fn wait_for_state(backend: &mut WmiBackend, id: VmId, goal: VmState) {
     for _ in 0..60 {
