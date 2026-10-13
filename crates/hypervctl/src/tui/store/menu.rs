@@ -64,7 +64,8 @@ impl VmMenuItem {
     }
 
     /// The operation behind the item. `Create checkpoint` is not a state
-    /// change and is dispatched by the reducer itself.
+    /// change and is dispatched by the reducer itself, so its arm is
+    /// unreachable and holds a harmless placeholder.
     pub const fn op(self) -> VmOp {
         match self {
             Self::Start => VmOp::Start,
@@ -75,6 +76,8 @@ impl VmMenuItem {
             Self::Save => VmOp::Save,
             Self::Pause => VmOp::Pause,
             Self::Resume => VmOp::Resume,
+            // Never reached: menu_select dispatches CreateCheckpoint as an
+            // OpRequest::CreateCheckpoint, not through op().
             Self::CreateCheckpoint => VmOp::Start,
         }
     }

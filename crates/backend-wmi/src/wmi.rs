@@ -149,6 +149,21 @@ struct SespdRow {
     address: Option<String>,
 }
 
+/// A row of `Msvm_MemorySettingData` for a VM. The `Default` entry carries
+/// the startup amount and the dynamic-memory bounds; `VirtualQuantity`,
+/// `Reservation` and `Limit` are in MB (`VirtualQuantityUnits`).
+#[derive(Debug, Deserialize)]
+struct MemorySettingDataRow {
+    #[serde(rename = "VirtualQuantity")]
+    virtual_quantity: Option<u64>,
+    #[serde(rename = "DynamicMemoryEnabled")]
+    dynamic_memory_enabled: Option<bool>,
+    #[serde(rename = "Limit")]
+    limit: Option<u64>,
+    #[serde(rename = "Reservation")]
+    reservation: Option<u64>,
+}
+
 /// A row of `Msvm_EthernetPortAllocationSettingData` (NIC switch connection).
 /// `InstanceID` is `Microsoft:{vm-guid}\{nic-guid}\C`.
 #[derive(Debug, Deserialize)]
@@ -226,6 +241,21 @@ impl WmiBackend {
              FROM Msvm_VirtualSystemSettingData WHERE VirtualSystemIdentifier = '{id}'"
         );
         self.run_query(&wql)
+    }
+
+    /// The memory setting of a VM, if Hyper-V reported one. The entry whose
+    /// InstanceID starts with `Microsoft:{vm-guid}\` carries the startup
+    /// amount and the dynamic-memory bounds.
+    fn memory_setting_for_vm(
+        &mut self,
+        id: VmId,
+    ) -> Result<Option<MemorySettingDataRow>, HyperVError> {
+        let wql = format!(
+            "SELECT VirtualQuantity, DynamicMemoryEnabled, Limit, Reservation \
+             FROM Msvm_MemorySettingData WHERE InstanceID LIKE 'Microsoft:{id}\\\\%'"
+        );
+        let mut rows = self.run_query::<MemorySettingDataRow>(&wql)?;
+        Ok(rows.pop())
     }
 
     /// The realized (non-snapshot) VSSD of a VM, if Hyper-V reported one.
@@ -641,13 +671,24 @@ impl HyperV for WmiBackend {
             .map(|attached| attached.attachment)
             .collect();
         let nics = self.nics_for_vm(id)?;
-        // Integration services need a class that is not registered on all
-        // hosts; the default keeps the type honest (empty).
-        let memory = MemoryConfig {
-            startup_bytes: summary.memory_assigned_bytes.unwrap_or(0),
-            dynamic_enabled: false,
-            min_bytes: None,
-            max_bytes: None,
+        // Memory bounds come from the `Default` Msvm_MemorySettingData entry;
+        // quantities are in MB and converted to bytes.
+        let memory = match self.memory_setting_for_vm(id)? {
+            Some(row) => {
+                let mb = 1024u64 * 1024;
+                MemoryConfig {
+                    startup_bytes: row.virtual_quantity.unwrap_or(0) * mb,
+                    dynamic_enabled: row.dynamic_memory_enabled.unwrap_or(false),
+                    min_bytes: row.reservation.map(|v| v * mb),
+                    max_bytes: row.limit.map(|v| v * mb),
+                }
+            }
+            None => MemoryConfig {
+                startup_bytes: summary.memory_assigned_bytes.unwrap_or(0),
+                dynamic_enabled: false,
+                min_bytes: None,
+                max_bytes: None,
+            },
         };
         Ok(VmDetail {
             summary,
@@ -657,6 +698,8 @@ impl HyperV for WmiBackend {
             nics,
             checkpoint_count,
             config_path,
+            // Integration services need a class that is not registered on
+            // all hosts; the default keeps the type honest (empty).
             integration_services: Vec::new(),
             notes,
         })
@@ -748,6 +791,33 @@ impl HyperV for WmiBackend {
             specified: id.to_string(),
             raw: None,
         })?;
+        // Connected VMs: EPASD entries whose LastKnownSwitchName matches and
+        // whose InstanceID has the `\C` suffix (VM NICs, not host vNICs).
+        let epasd: Vec<EpasdRow> = self.run_query(&format!(
+            "SELECT InstanceID, LastKnownSwitchName FROM Msvm_EthernetPortAllocationSettingData \
+             WHERE LastKnownSwitchName = '{}'",
+            row.element_name
+        ))?;
+        let mut connected_vm_ids = Vec::new();
+        for entry in epasd {
+            if entry.last_known_switch_name.as_deref() != Some(row.element_name.as_str()) {
+                continue;
+            }
+            // InstanceID is `Microsoft:{vm-guid}\{nic-guid}\C`; host vNICs
+            // have the switch GUID in the first slot and no `\C` suffix.
+            if let Some(rest) = entry.instance_id.strip_prefix("Microsoft:") {
+                if let Some((vm_part, tail)) = rest.split_once('\\') {
+                    if tail.ends_with("\\C") {
+                        if let Ok(vm_id) = vm_part.parse::<uuid::Uuid>() {
+                            let vm_id = VmId::new(vm_id);
+                            if !connected_vm_ids.contains(&vm_id) {
+                                connected_vm_ids.push(vm_id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let summary = SwitchSummary {
             id,
             name: row.element_name,
@@ -763,7 +833,7 @@ impl HyperV for WmiBackend {
                 native_id: None,
                 allowed_ids: Vec::new(),
             },
-            connected_vm_ids: Vec::new(),
+            connected_vm_ids,
         })
     }
 
