@@ -403,6 +403,107 @@ fn a_checkpoint_of_a_running_vm_cannot_be_restored() {
     let err = stderr(&output);
     assert!(err.contains("error:"), "{err:?}");
     assert!(err.contains("not valid in state Running"), "{err:?}");
+    // Spec 2.12: this rejections has a hint, and only this one.
+    assert!(
+        err.contains("hint: Stop the VM before restoring a checkpoint."),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn checkpoint_create_reports_the_created_id_and_name() {
+    // Design 4.4: the designed line with the first eight characters of the id.
+    let output = run(&["checkpoint", "create", "web-01", "--name", "before-work"]);
+    assert_eq!(status(&output), 0, "{}", stderr(&output));
+    let err = stderr(&output);
+    assert!(
+        err.contains("web-01: checkpoint 'before-work' created (00c00001)"),
+        "{err:?}"
+    );
+
+    // Machine rows carry the full id and the name (spec 2.4, 2.10).
+    let json = run(&[
+        "-o",
+        "json",
+        "checkpoint",
+        "create",
+        "web-01",
+        "--name",
+        "after-work",
+    ]);
+    assert_eq!(status(&json), 0, "{}", stderr(&json));
+    let parsed: serde_json::Value = serde_json::from_str(&stdout(&json))
+        .unwrap_or_else(|error| panic!("the JSON must parse: {error}"));
+    assert_eq!(
+        parsed[0]["checkpoint_id"],
+        "00c00001-0000-0000-0000-000000000000"
+    );
+    assert_eq!(parsed[0]["checkpoint_name"], "after-work");
+
+    let csv = run(&[
+        "-o",
+        "csv",
+        "checkpoint",
+        "create",
+        "web-01",
+        "--name",
+        "csv-work",
+    ]);
+    assert_eq!(status(&csv), 0, "{}", stderr(&csv));
+    let text = String::from_utf8_lossy(&csv.stdout).into_owned();
+    assert!(
+        text.starts_with("id,name,status,checkpoint_id,checkpoint_name"),
+        "{text:?}"
+    );
+    assert!(
+        text.contains("00c00001-0000-0000-0000-000000000000,csv-work"),
+        "{text:?}"
+    );
+}
+
+#[test]
+fn naming_a_checkpoint_with_no_wait_is_a_usage_error() {
+    // Spec 2.4: `--name` and `--no-wait` exclude each other.
+    let output = run(&["checkpoint", "create", "web-01", "--name", "x", "--no-wait"]);
+    assert_eq!(status(&output), 2, "{}", stderr(&output));
+    assert!(stdout(&output).is_empty(), "{}", stdout(&output));
+    let err = stderr(&output);
+    assert!(err.contains("cannot be used with"), "{err:?}");
+}
+
+#[test]
+fn integration_services_show_a_dash_when_they_cannot_be_listed() {
+    // Design 3.8.5: a not-listable service set is one `-` row and `null` in
+    // JSON, distinct from an empty list.
+    let table = run(&["vm", "get", "web-02"]);
+    assert_eq!(status(&table), 0, "{}", stderr(&table));
+    let out = stdout(&table);
+    assert!(
+        out.lines()
+            .any(|line| line.contains("Services") && line.trim_end().ends_with('-')),
+        "{out:?}"
+    );
+
+    let null = run(&["-o", "json", "vm", "get", "web-02"]);
+    assert_eq!(status(&null), 0, "{}", stderr(&null));
+    let parsed: serde_json::Value = serde_json::from_str(&stdout(&null))
+        .unwrap_or_else(|error| panic!("the JSON must parse: {error}"));
+    assert_eq!(
+        parsed["integration_services"],
+        serde_json::Value::Null,
+        "{parsed}"
+    );
+
+    // A running VM has its services readable (spec 2.3).
+    let listed = run(&["-o", "json", "vm", "get", "web-01"]);
+    assert_eq!(status(&listed), 0, "{}", stderr(&listed));
+    let parsed: serde_json::Value = serde_json::from_str(&stdout(&listed))
+        .unwrap_or_else(|error| panic!("the JSON must parse: {error}"));
+    assert_eq!(
+        parsed["integration_services"].as_array().map(Vec::len),
+        Some(2),
+        "{parsed}"
+    );
 }
 
 #[test]

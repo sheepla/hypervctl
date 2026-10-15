@@ -3,7 +3,7 @@
 
 use std::io::Write;
 
-use hypervctl_core::HyperVError;
+use hypervctl_core::{HyperVError, JobFailReason, VmState};
 
 /// Everything that ends a command before it has results to show.
 #[derive(Debug, PartialEq)]
@@ -63,8 +63,35 @@ pub fn hint(error: &HyperVError) -> Option<&'static str> {
             Some("Enable the Hyper-V feature / check that the vmms service is running")
         }
         HyperVError::Backend { .. } => Some("Re-run with -v to see the raw provider error"),
+        HyperVError::JobFailed { reason, .. } => match reason {
+            JobFailReason::GuestNotReady => {
+                Some("The guest did not accept the request because its integration services are not running. Use --force to power off.")
+            }
+            JobFailReason::HostOutOfMemory => {
+                Some("The host does not have enough free memory to start the VM.")
+            }
+            JobFailReason::Other => None,
+        },
+        HyperVError::InvalidState {
+            state, operation, ..
+        } => {
+            if *state == VmState::Running && is_restore(operation) {
+                Some("Stop the VM before restoring a checkpoint.")
+            } else if state.is_transition() {
+                Some("The VM is changing state. Wait and retry, or omit --no-wait.")
+            } else {
+                None
+            }
+        }
         _ => None,
     }
+}
+
+/// Whether an `InvalidState` is about restoring. The operation layer reports
+/// the command's verb and a backend that wins the race reports its method,
+/// and both mean the same restore to the user (spec 2.12).
+fn is_restore(operation: &str) -> bool {
+    matches!(operation, "restore_checkpoint" | "checkpoint restore")
 }
 
 /// Writes a backend error, the candidates of an ambiguous name, its hint and
@@ -152,7 +179,8 @@ mod tests {
     use std::time::Duration;
 
     use hypervctl_core::{
-        Candidate, HyperVError, RawError, Target, TargetKind, UnavailableReason, VmId, VmState,
+        Candidate, HyperVError, JobFailReason, RawError, Target, TargetKind, UnavailableReason,
+        VmId, VmState,
     };
     use uuid::Uuid;
 
@@ -193,20 +221,30 @@ mod tests {
     }
 
     fn invalid_state() -> HyperVError {
+        invalid_state_of(VmState::Off, "pause")
+    }
+
+    fn invalid_state_of(state: VmState, operation: &str) -> HyperVError {
         HyperVError::InvalidState {
             target: None,
-            state: VmState::Off,
-            operation: "pause".to_string(),
+            state,
+            operation: operation.to_string(),
             raw: None,
         }
     }
 
     fn job_failed() -> HyperVError {
+        job_failed_because(JobFailReason::Other)
+    }
+
+    fn job_failed_because(reason: JobFailReason) -> HyperVError {
         HyperVError::JobFailed {
-            code: 32770,
-            message: "not supported".to_string(),
-            reason: hypervctl_core::JobFailReason::Other,
-            raw: None,
+            code: 0x800710DF,
+            reason,
+            raw: Some(RawError::with_hresult(
+                0x800710DF_u32 as i32,
+                "Anmeldefehler beim Gastdienst",
+            )),
         }
     }
 
@@ -242,7 +280,11 @@ mod tests {
     }
 
     #[test]
-    fn only_the_classifications_of_the_table_have_a_hint() {
+    fn every_hint_of_the_table_appears_and_nothing_else_does() {
+        const RESTORE: &str = "Stop the VM before restoring a checkpoint.";
+        const BUSY: &str = "The VM is changing state. Wait and retry, or omit --no-wait.";
+
+        // The classifications that always carry a hint (spec 2.12).
         assert!(hint(&HyperVError::PermissionDenied { raw: None }).is_some());
         assert!(hint(&HyperVError::HyperVUnavailable {
             reason: UnavailableReason::ServiceStopped,
@@ -250,11 +292,109 @@ mod tests {
         })
         .is_some());
         assert!(hint(&HyperVError::backend(RawError::new("boom"))).is_some());
+
+        // JobFailed: only the two causes with fixed wording are hinted.
+        assert_eq!(
+            hint(&job_failed_because(JobFailReason::GuestNotReady)),
+            Some(
+                "The guest did not accept the request because its integration services are not running. Use --force to power off."
+            )
+        );
+        assert_eq!(
+            hint(&job_failed_because(JobFailReason::HostOutOfMemory)),
+            Some("The host does not have enough free memory to start the VM.")
+        );
+        assert_eq!(hint(&job_failed()), None);
+
+        // InvalidState: restoring a running VM, spelled the way each layer
+        // spells it, and every transitional state.
+        assert_eq!(
+            hint(&invalid_state_of(VmState::Running, "checkpoint restore")),
+            Some(RESTORE)
+        );
+        assert_eq!(
+            hint(&invalid_state_of(VmState::Running, "restore_checkpoint")),
+            Some(RESTORE)
+        );
+        for state in [VmState::Starting, VmState::Stopping, VmState::Busy] {
+            assert_eq!(hint(&invalid_state_of(state, "start")), Some(BUSY));
+            assert_eq!(
+                hint(&invalid_state_of(state, "checkpoint restore")),
+                Some(BUSY)
+            );
+        }
+
+        // Everything the table leaves without a hint.
         assert_eq!(hint(&not_found()), None);
         assert_eq!(hint(&ambiguous()), None);
         assert_eq!(hint(&timeout()), None);
         assert_eq!(hint(&invalid_state()), None);
-        assert_eq!(hint(&job_failed()), None);
+        assert_eq!(hint(&invalid_state_of(VmState::Running, "save")), None);
+        // An unverified `*` cell shows its state and gets no restore hint.
+        assert_eq!(
+            hint(&invalid_state_of(VmState::Saved, "checkpoint restore")),
+            None
+        );
+    }
+
+    #[test]
+    fn a_guest_not_ready_failure_prints_its_code_and_hint() {
+        let mut out = Vec::new();
+        write_backend(
+            &mut out,
+            &job_failed_because(JobFailReason::GuestNotReady),
+            0,
+        )
+        .unwrap_or_else(|error| panic!("writing to a vector cannot fail: {error}"));
+        let text = String::from_utf8_lossy(&out).into_owned();
+        // Spec 2.12: the code only; the provider message is `-v` material.
+        assert!(
+            text.starts_with("error: job failed (code 0x800710DF)\n"),
+            "{text:?}"
+        );
+        assert!(!text.contains("Anmeldefehler"), "{text:?}");
+        assert!(
+            text.contains(
+                "hint: The guest did not accept the request because its integration services are not running. Use --force to power off.\n"
+            ),
+            "{text:?}"
+        );
+
+        // With `-v` the provider message appears (design 3.8.2).
+        let mut loud = Vec::new();
+        write_backend(
+            &mut loud,
+            &job_failed_because(JobFailReason::GuestNotReady),
+            1,
+        )
+        .unwrap_or_else(|error| panic!("writing to a vector cannot fail: {error}"));
+        let loud = String::from_utf8_lossy(&loud).into_owned();
+        assert!(
+            loud.contains("  raw: 0x800710DF: Anmeldefehler"),
+            "{loud:?}"
+        );
+    }
+
+    #[test]
+    fn restoring_a_running_vm_prints_the_stop_hint() {
+        let mut out = Vec::new();
+        write_backend(
+            &mut out,
+            &invalid_state_of(VmState::Running, "checkpoint restore"),
+            0,
+        )
+        .unwrap_or_else(|error| panic!("writing to a vector cannot fail: {error}"));
+        let text = String::from_utf8_lossy(&out).into_owned();
+        assert!(
+            text.starts_with(
+                "error: operation 'checkpoint restore' is not valid in state Running\n"
+            ),
+            "{text:?}"
+        );
+        assert!(
+            text.contains("hint: Stop the VM before restoring a checkpoint.\n"),
+            "{text:?}"
+        );
     }
 
     #[test]

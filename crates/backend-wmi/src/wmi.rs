@@ -11,9 +11,10 @@ use std::time::Duration;
 
 use hypervctl_core::{
     AttachedVhd, ChangeEvent, Checkpoint, CheckpointId, CheckpointKind, Controller, ControllerKind,
-    HyperV, HyperVError, JobRef, JobStatus, MemoryConfig, NicConfig, Pending, RawError,
-    RequestedState, SwitchDetail, SwitchId, SwitchKind, SwitchSummary, TargetKind, VhdAttachment,
-    VhdFormat, VhdInfo, VhdKind, VlanMode, VlanSettings, VmDetail, VmId, VmState, VmSummary,
+    HyperV, HyperVError, JobFailReason, JobRef, JobStatus, MemoryConfig, NicConfig, Pending,
+    RawError, RequestedState, SwitchDetail, SwitchId, SwitchKind, SwitchSummary, TargetKind,
+    VhdAttachment, VhdFormat, VhdInfo, VhdKind, VlanMode, VlanSettings, VmDetail, VmId, VmState,
+    VmSummary,
 };
 use serde::Deserialize;
 use tokio::sync::mpsc;
@@ -704,9 +705,10 @@ impl HyperV for WmiBackend {
             nics,
             checkpoint_count,
             config_path,
-            // Integration services need a class that is not registered on
-            // all hosts; the default keeps the type honest (empty).
-            integration_services: Vec::new(),
+            // Not yet obtainable: the classes and their existence conditions
+            // are pending M11-V (design 3.8.5), so this is `None` rather than
+            // an empty list that would claim there are no services.
+            integration_services: None,
             notes,
         })
     }
@@ -1009,10 +1011,9 @@ impl HyperV for WmiBackend {
         let return_value = return_value(&out)?;
         if return_value != 0 {
             // 0x800710DF is the guest-not-ready code seen on real hardware
-            // (M0 item 5, V10).
+            // (M0 item 5, V10). `InitiateReboot` gives no provider text.
             return Err(HyperVError::JobFailed {
                 code: return_value,
-                message: format!("InitiateReboot returned {return_value}"),
                 reason: hypervctl_core::JobFailReason::GuestNotReady,
                 raw: None,
             });
@@ -1111,6 +1112,9 @@ impl HyperV for WmiBackend {
             10 => Ok(JobStatus::Failed {
                 code: row.error_code.unwrap_or(0),
                 message: row.error_description.unwrap_or_default(),
+                // M11-W1 replaces this with the classification from the code
+                // (design 3.8.2); unclassified means "no hint" per spec 2.12.
+                reason: JobFailReason::Other,
             }),
             // CIM: 3=Starting, 4=Running, 5=Canceling, 6=Completed with
             // warnings handled as Succeeded above only when 7.

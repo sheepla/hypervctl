@@ -26,8 +26,6 @@ pub async fn run(
             )?))
         }
         CheckpointCommand::Create { vm, name, wait } => {
-            // What the backend reports carries no identifier, so none is shown
-            // (design 4.4).
             let mut reporter = wait.waits().then(ProgressReporter::new);
             let outcome = ops
                 .create_checkpoint(vm, name.as_deref(), wait.policy(), &mut |progress| {
@@ -41,6 +39,7 @@ pub async fn run(
                 vec![outcome],
                 |success| describe(success, "checkpoint created"),
                 context.global.verbose,
+                context.render.no_trunc,
             );
             finish(found, context)
         }
@@ -63,6 +62,7 @@ pub async fn run(
                 vec![outcome],
                 |success| describe(success, "restored"),
                 context.global.verbose,
+                context.render.no_trunc,
             );
             finish(found, context)
         }
@@ -85,6 +85,7 @@ pub async fn run(
                 vec![outcome],
                 |success| describe(success, "removed"),
                 context.global.verbose,
+                context.render.no_trunc,
             );
             finish(found, context)
         }

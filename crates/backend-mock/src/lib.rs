@@ -14,8 +14,8 @@ use std::time::Duration;
 use hypervctl_core::vhd::vhd_path_eq;
 use hypervctl_core::{
     AttachedVhd, ChangeEvent, Checkpoint, CheckpointId, CheckpointKind, HyperV, HyperVError,
-    JobRef, JobStatus, Pending, RawError, RequestedState, SwitchDetail, SwitchId, SwitchSummary,
-    TargetKind, VhdAttachment, VhdInfo, VmDetail, VmId, VmState, VmSummary,
+    JobFailReason, JobRef, JobStatus, Pending, RawError, RequestedState, SwitchDetail, SwitchId,
+    SwitchSummary, TargetKind, VhdAttachment, VhdInfo, VmDetail, VmId, VmState, VmSummary,
 };
 use tokio::sync::mpsc::{self, UnboundedSender};
 // A paused test clock is honoured when the mock runs on a runtime thread;
@@ -76,6 +76,12 @@ pub struct MockBackend {
     transition_delay: Duration,
     injected_error: Option<HyperVError>,
     injected_delay: Option<Duration>,
+    /// Jobs that end `Failed` with these values, whatever else would happen
+    /// (design 3.5: failure injection).
+    failing_jobs: HashMap<JobRef, (u32, JobFailReason)>,
+    /// The next guest shutdown fails the way a guest without integration
+    /// services does (design 3.5).
+    guest_not_ready: bool,
 }
 
 impl Default for MockBackend {
@@ -105,6 +111,8 @@ impl MockBackend {
             transition_delay: DEFAULT_TRANSITION_DELAY,
             injected_error: None,
             injected_delay: None,
+            failing_jobs: HashMap::new(),
+            guest_not_ready: false,
         }
     }
 
@@ -136,6 +144,13 @@ impl MockBackend {
         self.injected_delay = Some(delay);
     }
 
+    /// The next guest shutdown fails the way a guest without integration
+    /// services does: its job fails immediately with `GuestNotReady`
+    /// (`0x800710DF`) and the VM stays Running (design 3.5, anomaly 16).
+    pub fn inject_guest_not_ready(&mut self) {
+        self.guest_not_ready = true;
+    }
+
     /// Keeps every job Running for its first polls queries, whatever the
     /// clock says, and finished after that. Tests use it to reach a timeout and
     /// then watch the very same job finish, without waiting (design 3.5).
@@ -145,6 +160,12 @@ impl MockBackend {
 
     pub fn set_transition_delay(&mut self, delay: Duration) {
         self.transition_delay = delay;
+    }
+
+    /// How transitions advance from now on. Tests that need a transition to
+    /// stay in flight choose `TickMode::Manual` (design 3.5).
+    pub fn set_tick_mode(&mut self, mode: TickMode) {
+        self.tick_mode = mode;
     }
 
     /// Consumes pending injections and, in automatic mode, settles due
@@ -231,9 +252,12 @@ impl MockBackend {
 
     fn next_checkpoint_id(&mut self) -> CheckpointId {
         self.next_checkpoint += 1;
-        CheckpointId::new(Uuid::from_u128(u128::from(
-            0x00C0_0000_0000_0000_u64 + self.next_checkpoint,
-        )))
+        // The counter sits in the most significant bits, exactly like the
+        // fixture's ids, so the eight characters `table` prints tell created
+        // checkpoints apart (design 4.4).
+        CheckpointId::new(Uuid::from_u128(
+            u128::from(0x00C0_0000_u32 + self.next_checkpoint as u32) << 96,
+        ))
     }
 }
 
@@ -329,6 +353,15 @@ impl HyperV for MockBackend {
         request: RequestedState,
     ) -> Result<Pending, HyperVError> {
         self.begin()?;
+        if request == RequestedState::ShutDown && self.guest_not_ready {
+            // The guest rejects the shutdown: the job exists and fails
+            // immediately, and the VM stays Running (M0 item 5, design 3.3).
+            self.guest_not_ready = false;
+            let job = self.new_job(id);
+            self.failing_jobs
+                .insert(job.clone(), (0x800710DF, JobFailReason::GuestNotReady));
+            return Ok(Pending::Job(job));
+        }
         let (intermediate, target) = match request {
             RequestedState::Start => (VmState::Starting, VmState::Running),
             RequestedState::ShutDown => (VmState::Stopping, VmState::Off),
@@ -347,10 +380,8 @@ impl HyperV for MockBackend {
             },
         );
         self.announce(ChangeEvent::Vms);
-        if request == RequestedState::ShutDown {
-            // No job exists for a guest shutdown; the state is the progress.
-            return Ok(Pending::AwaitState(id, target));
-        }
+        // A guest shutdown comes back as a job too (M0: the normal shutdown
+        // also returns a job, design 3.1; `AwaitState` is never produced).
         Ok(Pending::Job(self.new_job(id)))
     }
 
@@ -472,6 +503,16 @@ impl HyperV for MockBackend {
 
     fn job_status(&mut self, job: JobRef) -> Result<JobStatus, HyperVError> {
         self.begin()?;
+        if let Some((code, reason)) = self.failing_jobs.get(&job).copied() {
+            // An injected failure stays failed: the job object keeps answering
+            // `Failed`, the way a real job stays in its `Exception` state.
+            return Ok(JobStatus::Failed {
+                code,
+                // The mock never invents provider text (anomaly 22).
+                message: String::new(),
+                reason,
+            });
+        }
         let vm =
             self.jobs.get(&job).copied().ok_or_else(|| {
                 HyperVError::backend(RawError::new(format!("unknown job '{job}'")))
@@ -561,6 +602,21 @@ mod tests {
     }
 
     #[test]
+    fn integration_services_are_absent_when_they_could_not_be_read() {
+        // Anomaly 22 (mock side) / design 3.8.5: a VM that is not running
+        // reports `None`, which is not the same as an empty service list.
+        let mut backend = MockBackend::with_fixture();
+        let running = ok(backend.get_vm(vm_id(1)));
+        assert!(!some(
+            running.integration_services.as_ref(),
+            "web-01 integration services"
+        )
+        .is_empty());
+        assert!(ok(backend.get_vm(vm_id(2))).integration_services.is_none());
+        assert!(ok(backend.get_vm(vm_id(4))).integration_services.is_none());
+    }
+
+    #[test]
     fn a_request_lands_in_a_transitional_state_until_it_is_ticked() {
         let mut backend = MockBackend::with_fixture();
         backend.tick_mode = TickMode::Manual;
@@ -594,12 +650,38 @@ mod tests {
     }
 
     #[test]
-    fn a_guest_shutdown_waits_for_the_state_instead_of_a_job() {
+    fn a_guest_shutdown_comes_back_as_a_job() {
+        // Design 3.1: `ShutDown` returns a job; `AwaitState` is never produced
+        // (M0: the normal shutdown returns a job too).
         let mut backend = MockBackend::with_fixture();
         backend.set_transition_delay(Duration::ZERO);
         let pending = ok(backend.request_vm_state(vm_id(1), RequestedState::ShutDown));
-        assert!(matches!(pending, Pending::AwaitState(_, VmState::Off)));
+        let job = job_of(pending.clone());
+        assert!(matches!(pending, Pending::Job(_)));
+        // The zero delay settles on the next call, and then the job succeeded.
         assert_eq!(state_of(&mut backend, "web-01"), VmState::Off);
+        assert_eq!(ok(backend.job_status(job)), JobStatus::Succeeded);
+    }
+
+    #[test]
+    fn an_injected_guest_not_ready_shutdown_fails_its_job_immediately() {
+        // Anomaly 16: the job fails right away and the VM stays Running.
+        let mut backend = MockBackend::with_fixture();
+        backend.inject_guest_not_ready();
+        let pending = ok(backend.request_vm_state(vm_id(1), RequestedState::ShutDown));
+        let job = job_of(pending);
+        assert_eq!(state_of(&mut backend, "web-01"), VmState::Running);
+        assert_eq!(
+            ok(backend.job_status(job.clone())),
+            JobStatus::Failed {
+                code: 0x800710DF,
+                message: String::new(),
+                reason: JobFailReason::GuestNotReady,
+            }
+        );
+        // The injection is consumed: the next shutdown behaves normally.
+        let next = ok(backend.request_vm_state(vm_id(1), RequestedState::ShutDown));
+        assert!(matches!(next, Pending::Job(_)));
     }
 
     #[test]

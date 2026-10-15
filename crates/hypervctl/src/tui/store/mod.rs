@@ -1016,7 +1016,7 @@ mod tests {
             nics: Vec::new(),
             checkpoint_count: 0,
             config_path: String::new(),
-            integration_services: Vec::new(),
+            integration_services: None,
             notes: None,
         }
     }

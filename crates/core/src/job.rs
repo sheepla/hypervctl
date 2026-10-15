@@ -3,6 +3,7 @@
 use std::fmt;
 use std::time::Duration;
 
+use crate::error::JobFailReason;
 use crate::ids::VmId;
 use crate::vm::VmState;
 
@@ -66,7 +67,11 @@ pub enum JobStatus {
     Succeeded,
     Failed {
         code: u32,
+        /// Localized provider text; only `-v` may show it (design 3.8.2).
         message: String,
+        /// The classified cause, decided where the code was observed
+        /// (design 3.8.2: the classification is the backend's).
+        reason: JobFailReason,
     },
     Cancelled,
 }
@@ -93,7 +98,8 @@ mod tests {
         assert!(JobStatus::Cancelled.is_finished());
         assert!(JobStatus::Failed {
             code: 32770,
-            message: "no".to_string()
+            message: "no".to_string(),
+            reason: JobFailReason::Other,
         }
         .is_finished());
     }

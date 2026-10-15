@@ -69,8 +69,10 @@ fn vm(
         },
         checkpoint_count,
         config_path: format!(r"C:\HyperV\{name}\{name}.vmcx"),
+        // The services cannot be listed while the VM is not running, so the
+        // mock returns `None` there rather than an empty list (design 3.8.5).
         integration_services: if running {
-            vec![
+            Some(vec![
                 IntegrationService {
                     name: "Heartbeat".to_string(),
                     enabled: true,
@@ -81,9 +83,9 @@ fn vm(
                     enabled: true,
                     status: IntegrationStatus::Operational,
                 },
-            ]
+            ])
         } else {
-            Vec::new()
+            None
         },
         notes: None,
     }

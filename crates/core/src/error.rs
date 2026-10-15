@@ -143,10 +143,12 @@ pub enum HyperVError {
         raw: Option<RawError>,
     },
 
-    #[error("Hyper-V job {code} failed: {message}")]
+    // The code is all the normal display shows: provider messages are
+    // localized, so they live in `raw` and appear only with `-v`
+    // (design 3.8.2, spec 2.12).
+    #[error("job failed (code {code:#010X})")]
     JobFailed {
         code: u32,
-        message: String,
         reason: JobFailReason,
         raw: Option<RawError>,
     },
@@ -279,14 +281,26 @@ mod tests {
     }
 
     #[test]
-    fn job_failure_keeps_its_code() {
+    fn job_failure_shows_only_its_code() {
         let error = HyperVError::JobFailed {
+            code: 0x800710DF,
+            reason: JobFailReason::GuestNotReady,
+            raw: Some(RawError::with_hresult(
+                0x800710DF_u32 as i32,
+                "guest rejected the request",
+            )),
+        };
+        // Spec 2.12: the code only; the localized message is `-v` material.
+        assert_eq!(error.to_string(), "job failed (code 0x800710DF)");
+        assert!(!error.to_string().contains("guest rejected"));
+        assert!(error.raw().is_some());
+
+        let unknown = HyperVError::JobFailed {
             code: 32770,
-            message: "not supported".to_string(),
             reason: JobFailReason::Other,
             raw: None,
         };
-        assert_eq!(error.to_string(), "Hyper-V job 32770 failed: not supported");
+        assert_eq!(unknown.to_string(), "job failed (code 0x00008002)");
     }
 
     #[test]

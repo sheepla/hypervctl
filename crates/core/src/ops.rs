@@ -446,6 +446,17 @@ impl Operations {
         let result = match self.resolve_vm(vm).await {
             Err(error) => Err(error),
             Ok(id) => {
+                if let Err(error) = self
+                    .checkpoint_gate(id, OpKind::CheckpointCreate, &mut ctx)
+                    .await
+                {
+                    return OpOutcome {
+                        target: vm.to_string(),
+                        id: Some(OpId::Vm(id)),
+                        created: None,
+                        result: Err(error),
+                    };
+                }
                 // Snapshot the id set before the request (design 3.3 step 1).
                 let before: HashSet<CheckpointId> = match self.handle.list_checkpoints(id).await {
                     Ok(list) => list.into_iter().map(|cp| cp.id).collect(),
@@ -619,10 +630,18 @@ impl Operations {
                 Err(error) => Err(error),
                 Ok(target) => {
                     id = Some(OpId::Checkpoint(target));
-                    notify(&mut ctx, Phase::Requesting, None);
-                    match self.handle.restore_checkpoint(found, target).await {
+                    match self
+                        .checkpoint_gate(found, OpKind::CheckpointRestore, &mut ctx)
+                        .await
+                    {
                         Err(error) => Err(error),
-                        Ok(pending) => self.finish(found, pending, None, &mut ctx).await,
+                        Ok(()) => {
+                            notify(&mut ctx, Phase::Requesting, None);
+                            match self.handle.restore_checkpoint(found, target).await {
+                                Err(error) => Err(error),
+                                Ok(pending) => self.finish(found, pending, None, &mut ctx).await,
+                            }
+                        }
                     }
                 }
             },
@@ -653,10 +672,18 @@ impl Operations {
                 Err(error) => Err(error),
                 Ok(target) => {
                     id = Some(OpId::Checkpoint(target));
-                    notify(&mut ctx, Phase::Requesting, None);
-                    match self.handle.remove_checkpoint(target).await {
+                    match self
+                        .checkpoint_gate(found, OpKind::CheckpointRemove, &mut ctx)
+                        .await
+                    {
                         Err(error) => Err(error),
-                        Ok(pending) => self.finish(found, pending, None, &mut ctx).await,
+                        Ok(()) => {
+                            notify(&mut ctx, Phase::Requesting, None);
+                            match self.handle.remove_checkpoint(target).await {
+                                Err(error) => Err(error),
+                                Ok(pending) => self.finish(found, pending, None, &mut ctx).await,
+                            }
+                        }
                     }
                 }
             },
@@ -700,6 +727,29 @@ impl Operations {
             state = self.state(id).await?;
         }
         Ok(state)
+    }
+
+    /// The settled state with the availability table's verdict for one
+    /// checkpoint operation (spec 2.9): a wait cell settles first and is
+    /// re-judged, and `--no-wait` or a reject cell reports `InvalidState`
+    /// before any request reaches the backend (design 3.3). The backend keeps
+    /// its own defense for the race between this check and the request.
+    async fn checkpoint_gate(
+        &self,
+        id: VmId,
+        op: OpKind,
+        ctx: &mut Ctx<'_>,
+    ) -> Result<(), HyperVError> {
+        let observed = self.settle(id, ctx).await?;
+        match availability(op, observed) {
+            Availability::Ok | Availability::Already => Ok(()),
+            Availability::Wait | Availability::Reject => Err(HyperVError::InvalidState {
+                target: Some(id),
+                state: observed,
+                operation: op.to_string(),
+                raw: None,
+            }),
+        }
     }
 
     /// One verb on one already resolved VM.
@@ -951,12 +1001,17 @@ impl Operations {
                     sleep_for(JOB_POLL, ctx.deadline).await;
                 }
                 JobStatus::Succeeded => break,
-                JobStatus::Failed { code, message } => {
+                JobStatus::Failed {
+                    code,
+                    message,
+                    reason,
+                } => {
+                    // The job failed; waiting stops right here (design 3.3).
+                    // The message is localized, so it goes into `raw`.
                     return Err(HyperVError::JobFailed {
                         code,
-                        message,
-                        reason: crate::error::JobFailReason::Other,
-                        raw: None,
+                        reason,
+                        raw: Some(RawError::with_hresult(code as i32, message)),
                     });
                 }
                 JobStatus::Cancelled => {

@@ -224,7 +224,9 @@ pub enum CheckpointCommand {
         vm: String,
 
         /// Name for the new checkpoint; the backend picks one when omitted
-        #[arg(long)]
+        // Naming happens after the creation job, so there is nothing to wait
+        // for (`--no-wait`) (spec 2.4).
+        #[arg(long, conflicts_with = "no_wait")]
         name: Option<String>,
 
         #[command(flatten)]
@@ -542,6 +544,48 @@ mod tests {
         assert!(parse(&["hypervctl", "vm", "start", "web-01", "--no-wait"]).is_ok());
         assert!(parse(&["hypervctl", "vm", "start", "web-01", "--timeout", "5"]).is_ok());
         assert!(parse(&["hypervctl", "vm", "start", "web-01", "--timeout", "0"]).is_ok());
+    }
+
+    #[test]
+    fn naming_a_checkpoint_and_no_wait_are_mutually_exclusive() {
+        // Spec 2.4: the name is applied after the creation, which `--no-wait`
+        // does not follow.
+        assert!(parse(&[
+            "hypervctl",
+            "checkpoint",
+            "create",
+            "web-01",
+            "--name",
+            "before-work",
+            "--no-wait"
+        ])
+        .is_err());
+        assert!(parse(&[
+            "hypervctl",
+            "checkpoint",
+            "create",
+            "web-01",
+            "--no-wait",
+            "--name",
+            "before-work"
+        ])
+        .is_err());
+        // Either on its own is fine.
+        let named = ok_parse(&[
+            "hypervctl",
+            "checkpoint",
+            "create",
+            "web-01",
+            "--name",
+            "before-work",
+        ]);
+        assert!(matches!(
+            &named.resource,
+            Resource::Checkpoint {
+                command: CheckpointCommand::Create { name: Some(name), .. }
+            } if name == "before-work"
+        ));
+        assert!(parse(&["hypervctl", "checkpoint", "create", "web-01", "--no-wait"]).is_ok());
     }
 
     #[test]

@@ -81,6 +81,7 @@ async fn operate(
         outcomes,
         |success| describe(success, op),
         context.global.verbose,
+        context.render.no_trunc,
     );
     finish(found, context)
 }

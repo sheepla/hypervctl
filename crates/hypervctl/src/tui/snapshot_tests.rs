@@ -39,7 +39,7 @@ fn detail_of(summary: VmSummary) -> VmDetail {
         nics: Vec::new(),
         checkpoint_count: 1,
         config_path: r"C:\ProgramData\Microsoft\Windows\Hyper-V\web-01.xml".to_string(),
-        integration_services: Vec::new(),
+        integration_services: None,
         notes: None,
     }
 }

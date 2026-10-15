@@ -269,7 +269,8 @@ pub struct VmDetailView {
     pub nics: Vec<NicView>,
     pub checkpoint_count: u32,
     pub config_path: String,
-    pub integration_services: Vec<IntegrationView>,
+    /// `null` when the services could not be listed (design 3.8.5).
+    pub integration_services: Option<Vec<IntegrationView>>,
     pub notes: Option<String>,
     #[serde(skip)]
     pub state_label: String,
@@ -319,19 +320,21 @@ impl VmDetailView {
             nics: nics.iter().map(NicView::from).collect(),
             checkpoint_count,
             config_path,
-            integration_services: integration_services
-                .into_iter()
-                .map(|service| {
-                    let (label, value, status_raw) = integration_status_parts(service.status);
-                    IntegrationView {
-                        name: service.name,
-                        enabled: service.enabled,
-                        status: value,
-                        status_raw,
-                        status_label: label,
-                    }
-                })
-                .collect(),
+            integration_services: integration_services.map(|services| {
+                services
+                    .into_iter()
+                    .map(|service| {
+                        let (label, value, status_raw) = integration_status_parts(service.status);
+                        IntegrationView {
+                            name: service.name,
+                            enabled: service.enabled,
+                            status: value,
+                            status_raw,
+                            status_label: label,
+                        }
+                    })
+                    .collect()
+            }),
             notes,
             state_label: state,
         }
@@ -407,17 +410,24 @@ impl DetailTable for VmDetailView {
         for (index, nic) in self.nics.iter().enumerate() {
             rows.push((format!("Nic {index}"), Cell::new(nic_label(nic))));
         }
-        for service in &self.integration_services {
-            let label = format!(
-                "{}, {}",
-                if service.enabled {
-                    "enabled"
-                } else {
-                    "disabled"
-                },
-                service.status_label
-            );
-            rows.push((format!("Service: {}", service.name), Cell::new(label)));
+        match &self.integration_services {
+            // Not readable (e.g. the VM is not running): one `-` row, which an
+            // empty service list would not produce (design 3.8.5).
+            None => rows.push(("Services".to_string(), Cell::dash(None::<String>))),
+            Some(services) => {
+                for service in services {
+                    let label = format!(
+                        "{}, {}",
+                        if service.enabled {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        },
+                        service.status_label
+                    );
+                    rows.push((format!("Service: {}", service.name), Cell::new(label)));
+                }
+            }
         }
         rows.push(("Notes".to_string(), Cell::dash(self.notes.clone())));
         rows

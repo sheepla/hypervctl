@@ -103,7 +103,10 @@ pub struct VmDetail {
     pub checkpoint_count: u32,
     /// Location of the configuration file.
     pub config_path: String,
-    pub integration_services: Vec<IntegrationService>,
+    /// The integration services and their state. `None` means they could not
+    /// be listed (e.g. the VM is not running), which is not the same as an
+    /// empty list of services (design 3.8.5).
+    pub integration_services: Option<Vec<IntegrationService>>,
     pub notes: Option<String>,
 }
 

@@ -5,7 +5,7 @@ use serde::Serialize;
 
 use hypervctl_core::{HyperVError, OpId, OpOutcome, OpSuccess, VmState};
 
-use super::{csv, json, to_value, RenderOptions};
+use super::{csv, format, json, to_value, RenderOptions};
 use crate::cli::args::Format;
 use crate::cli::errors::{backend_exit_code, write_backend, write_failures};
 
@@ -18,6 +18,12 @@ pub struct OpRow {
     /// The target exactly as the user typed it.
     pub name: String,
     pub status: OpStatus,
+    /// Present only when this command created a checkpoint, even when the
+    /// command then failed: the checkpoint exists either way (spec 2.4).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint_name: Option<String>,
     /// Present only when the operation failed (design 4.4).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<OpError>,
@@ -67,7 +73,9 @@ pub struct OpReport {
 ///
 /// `describe` words a success for a human (`stopped`, `already running`); the
 /// machine-readable rows take their status from the outcome itself.
-pub fn report<F>(outcomes: Vec<OpOutcome>, describe: F, verbose: u8) -> OpReport
+/// `no_trunc` decides how much of a created checkpoint's id the text lines
+/// show (spec 2.10); the rows always carry it in full.
+pub fn report<F>(outcomes: Vec<OpOutcome>, describe: F, verbose: u8, no_trunc: bool) -> OpReport
 where
     F: Fn(&OpSuccess) -> String,
 {
@@ -75,38 +83,73 @@ where
     let mut rows = Vec::with_capacity(total);
     let mut success_lines = Vec::new();
     let mut failures: Vec<(String, HyperVError)> = Vec::new();
+    let mut created_lines: Vec<String> = Vec::new();
     let mut failed = 0usize;
+    let mut created_failure = false;
 
     for outcome in outcomes {
-        let id = outcome.id.map(id_text);
-        match outcome.result {
+        let OpOutcome {
+            target,
+            id,
+            created,
+            result,
+        } = outcome;
+        let row_id = id.map(id_text);
+        let checkpoint_id = created.as_ref().map(|(id, _)| id.to_string());
+        let checkpoint_name = created.as_ref().map(|(_, name)| name.clone());
+        // A created checkpoint gets its own line with its id (design 4.4,
+        // spec 2.4), for a success and for a failure alike.
+        let created_line = match (&checkpoint_id, &checkpoint_name) {
+            (Some(id), Some(name)) => Some(format!(
+                "{}: checkpoint '{}' created ({})",
+                target,
+                name,
+                format::short_id(id, no_trunc)
+            )),
+            _ => None,
+        };
+        match result {
             Ok(success) => {
                 let status = match success {
                     OpSuccess::Already { .. } => OpStatus::Already,
                     OpSuccess::Submitted { .. } => OpStatus::Submitted,
                     OpSuccess::Completed { .. } => OpStatus::Succeeded,
                 };
-                success_lines.push(format!("{}: {}", outcome.target, describe(&success)));
+                match created_line {
+                    Some(line) => success_lines.push(line),
+                    None => success_lines.push(format!("{}: {}", target, describe(&success))),
+                }
                 rows.push(OpRow {
-                    id,
-                    name: outcome.target,
+                    id: row_id,
+                    name: target,
                     status,
+                    checkpoint_id,
+                    checkpoint_name,
                     error: None,
                 });
             }
             Err(error) => {
                 failed += 1;
                 let message = error.to_string();
+                if let Some(line) = created_line {
+                    // The checkpoint exists even though the command failed
+                    // (spec 2.4): its line is appended beside the error and
+                    // this failure is reported target by target.
+                    created_failure = true;
+                    created_lines.push(line);
+                }
                 rows.push(OpRow {
-                    id,
-                    name: outcome.target.clone(),
+                    id: row_id,
+                    name: target.clone(),
                     status: OpStatus::Failed,
+                    checkpoint_id,
+                    checkpoint_name,
                     error: Some(OpError {
                         kind: error.kind().to_string(),
                         message,
                     }),
                 });
-                failures.push((outcome.target, error));
+                failures.push((target, error));
             }
         }
     }
@@ -122,12 +165,20 @@ where
     } else {
         let _ = write_failures(&mut text, &failures, verbose);
     }
+    for line in &created_lines {
+        text.extend_from_slice(line.as_bytes());
+        text.push(b'\n');
+    }
     let failure_text = String::from_utf8_lossy(&text).into_owned();
 
     // One failure that stands for everybody: the backend could not be reached
     // at all (design 4.7). Everything else that fails at least once is a 1 when
     // there were several targets, and its own classification when there was one.
-    let whole = failed > 0
+    // A created checkpoint puts the command at exit code 1 instead: it ran
+    // (spec 2.4), so it is reported as its one target, never as one error for
+    // the whole command.
+    let whole = !created_failure
+        && failed > 0
         && failed == total
         && failures.iter().all(|(_, error)| {
             matches!(
@@ -139,7 +190,9 @@ where
             .windows(2)
             .all(|pair| std::mem::discriminant(&pair[0].1) == std::mem::discriminant(&pair[1].1));
 
-    let code = if failed == 0 {
+    let code = if created_failure {
+        1
+    } else if failed == 0 {
         0
     } else if whole {
         failures
@@ -246,7 +299,7 @@ mod tests {
                 }),
             ),
         ];
-        let found = report(outcomes, describe, 0);
+        let found = report(outcomes, describe, 0, false);
         assert_eq!(found.code, 0);
         assert!(found.fatal.is_none());
         assert_eq!(
@@ -281,7 +334,7 @@ mod tests {
                 }),
             },
         ];
-        let found = report(outcomes, describe, 0);
+        let found = report(outcomes, describe, 0, false);
         assert_eq!(found.code, 1);
         assert!(found.fatal.is_none());
         assert!(
@@ -313,7 +366,7 @@ mod tests {
                 raw: None,
             }),
         }];
-        let found = report(outcomes, describe, 0);
+        let found = report(outcomes, describe, 0, false);
         assert_eq!(found.code, 3);
         assert!(found.fatal.is_none());
         // The command line already names the one target, so the error is not
@@ -333,7 +386,7 @@ mod tests {
             vm_outcome("web-01", Err(HyperVError::PermissionDenied { raw: None })),
             vm_outcome("web-02", Err(HyperVError::PermissionDenied { raw: None })),
         ];
-        let found = report(outcomes, describe, 0);
+        let found = report(outcomes, describe, 0, false);
         assert_eq!(found.code, 4);
         assert!(matches!(
             found.fatal,
@@ -362,7 +415,7 @@ mod tests {
                 result: Err(not_found()),
             },
         ];
-        let found = report(outcomes, describe, 0);
+        let found = report(outcomes, describe, 0, false);
         assert_eq!(found.code, 1);
         assert!(found.fatal.is_none());
     }
@@ -374,12 +427,16 @@ mod tests {
                 id: Some("00000001-0000-0000-0000-000000000000".to_string()),
                 name: "web-01".to_string(),
                 status: OpStatus::Already,
+                checkpoint_id: None,
+                checkpoint_name: None,
                 error: None,
             },
             OpRow {
                 id: None,
                 name: "nope".to_string(),
                 status: OpStatus::Failed,
+                checkpoint_id: None,
+                checkpoint_name: None,
                 error: Some(OpError {
                     kind: "not_found".to_string(),
                     message: "VM not found: 'nope'".to_string(),
@@ -437,10 +494,102 @@ mod tests {
             created: None,
             result: Ok(completed()),
         };
-        let found = report(vec![outcome], |_| "restored".to_string(), 0);
+        let found = report(vec![outcome], |_| "restored".to_string(), 0, false);
         assert_eq!(
             found.rows[0].id.as_deref(),
             Some("00000101-0000-0000-0000-000000000000")
+        );
+    }
+
+    /// The created checkpoint of an outcome: id `0x100` and its name.
+    fn created_outcome(target: &str, result: Result<OpSuccess, HyperVError>) -> OpOutcome {
+        OpOutcome {
+            target: target.to_string(),
+            id: Some(OpId::Vm(VmId::new(Uuid::from_u128(0x1 << 96)))),
+            created: Some((
+                CheckpointId::new(Uuid::from_u128(0x100 << 96)),
+                "before-work".to_string(),
+            )),
+            result,
+        }
+    }
+
+    #[test]
+    fn a_created_checkpoint_names_and_identifies_itself() {
+        let found = report(
+            vec![created_outcome("web-01", Ok(completed()))],
+            |_| "checkpoint created".to_string(),
+            0,
+            false,
+        );
+        assert_eq!(found.code, 0);
+        assert_eq!(
+            found.success_lines,
+            vec!["web-01: checkpoint 'before-work' created (00000100)"]
+        );
+        assert_eq!(
+            found.rows[0].checkpoint_id.as_deref(),
+            Some("00000100-0000-0000-0000-000000000000")
+        );
+        assert_eq!(
+            found.rows[0].checkpoint_name.as_deref(),
+            Some("before-work")
+        );
+
+        // `--no-trunc` shows the whole identifier (spec 2.10).
+        let found = report(
+            vec![created_outcome("web-01", Ok(completed()))],
+            |_| "checkpoint created".to_string(),
+            0,
+            true,
+        );
+        assert_eq!(
+            found.success_lines,
+            vec!["web-01: checkpoint 'before-work' created (00000100-0000-0000-0000-000000000000)"]
+        );
+    }
+
+    #[test]
+    fn a_failure_that_created_a_checkpoint_reports_it_and_exits_one() {
+        // The failure a `--name` rename can produce; permission denied would
+        // otherwise become the error for the whole command (design 4.7).
+        let outcome = created_outcome("web-01", Err(HyperVError::PermissionDenied { raw: None }));
+        let found = report(
+            vec![outcome],
+            |_| "checkpoint created".to_string(),
+            0,
+            false,
+        );
+        // Spec 2.4: the checkpoint is kept, its id is shown, exit code 1.
+        assert_eq!(found.code, 1);
+        assert!(found.fatal.is_none(), "a created outcome is never fatal");
+        assert!(
+            found.failure_text.starts_with("error: permission denied\n"),
+            "{:?}",
+            found.failure_text
+        );
+        assert!(
+            found
+                .failure_text
+                .contains("web-01: checkpoint 'before-work' created (00000100)\n"),
+            "{:?}",
+            found.failure_text
+        );
+        assert_eq!(found.rows[0].status, OpStatus::Failed);
+        assert_eq!(
+            found.rows[0].checkpoint_id.as_deref(),
+            Some("00000100-0000-0000-0000-000000000000")
+        );
+        assert_eq!(
+            found.rows[0].checkpoint_name.as_deref(),
+            Some("before-work")
+        );
+        assert_eq!(
+            found.rows[0]
+                .error
+                .as_ref()
+                .map(|error| error.kind.as_str()),
+            Some("permission_denied")
         );
     }
 

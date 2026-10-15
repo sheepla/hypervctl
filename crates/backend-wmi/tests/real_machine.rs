@@ -343,8 +343,13 @@ fn checkpoint_create_list_and_remove_round_trip() {
         if status.is_finished() {
             match status {
                 hypervctl_core::JobStatus::Succeeded => break,
-                hypervctl_core::JobStatus::Failed { code, message } => {
-                    panic!("checkpoint job failed: {code} {message}");
+                hypervctl_core::JobStatus::Failed {
+                    code,
+                    message,
+                    reason,
+                    ..
+                } => {
+                    panic!("checkpoint job failed: {code} {message} ({reason})");
                 }
                 other => panic!("checkpoint job ended as {other:?}"),
             }
@@ -373,8 +378,13 @@ fn checkpoint_create_list_and_remove_round_trip() {
         if status.is_finished() {
             match status {
                 hypervctl_core::JobStatus::Succeeded => break,
-                hypervctl_core::JobStatus::Failed { code, message } => {
-                    panic!("destroy job failed: {code} {message}");
+                hypervctl_core::JobStatus::Failed {
+                    code,
+                    message,
+                    reason,
+                    ..
+                } => {
+                    panic!("destroy job failed: {code} {message} ({reason})");
                 }
                 other => panic!("destroy job ended as {other:?}"),
             }

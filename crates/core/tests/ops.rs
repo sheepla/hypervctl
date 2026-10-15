@@ -5,10 +5,10 @@
 
 use std::time::Duration;
 
-use hypervctl_backend_mock::MockBackend;
+use hypervctl_backend_mock::{MockBackend, TickMode};
 use hypervctl_core::{
-    BackendActor, HyperVError, JobRef, JobStatus, OpOutcome, OpSuccess, Operations, Pending, Phase,
-    Progress, TargetKind, VmOp, VmState, WaitPolicy,
+    BackendActor, HyperVError, JobFailReason, JobRef, JobStatus, OpOutcome, OpSuccess, Operations,
+    Pending, Phase, Progress, TargetKind, VmOp, VmState, WaitPolicy,
 };
 
 fn specs(names: &[&str]) -> Vec<String> {
@@ -302,6 +302,109 @@ async fn no_wait_returns_right_after_the_backend_accepts() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_guest_not_ready_shutdown_fails_immediately_instead_of_waiting() {
+    // Anomaly 16: the job fails at once; waiting must not turn this into a
+    // timeout, and the VM stays Running (M0 item 5).
+    let mut backend = fixture();
+    backend.inject_guest_not_ready();
+    let ops = operations(backend).await;
+
+    let outcomes = ops
+        .run_vm(
+            VmOp::Stop,
+            &specs(&["web-01"]),
+            WaitPolicy::Wait(Some(Duration::from_secs(60))),
+            &mut no_progress,
+        )
+        .await;
+    match failure(first(&outcomes)) {
+        HyperVError::JobFailed { code, reason, .. } => {
+            assert_eq!(*code, 0x800710DF);
+            assert_eq!(*reason, JobFailReason::GuestNotReady);
+        }
+        other => panic!("expected a job failure, got {other:?}"),
+    }
+
+    let vm = ok(ops
+        .handle()
+        .get_vm(ok(ops.resolve_vm("web-01").await))
+        .await);
+    assert_eq!(vm.summary.state, VmState::Running);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_restart_of_a_stopped_vm_is_invalid_and_sends_nothing() {
+    // Anomaly 17: the table allows restart only from Running.
+    let ops = operations(fixture()).await;
+    let mut phases: Vec<Phase> = Vec::new();
+    let mut record = |progress: Progress| phases.push(progress.phase);
+
+    let outcomes = ops
+        .run_vm(
+            VmOp::Restart,
+            &specs(&["web-02"]),
+            WaitPolicy::Wait(Some(Duration::from_secs(60))),
+            &mut record,
+        )
+        .await;
+    match failure(first(&outcomes)) {
+        HyperVError::InvalidState {
+            state, operation, ..
+        } => {
+            assert_eq!(*state, VmState::Off);
+            assert_eq!(operation, "restart");
+        }
+        other => panic!("expected an invalid state, got {other:?}"),
+    }
+    assert!(
+        !phases.contains(&Phase::Requesting),
+        "nothing may be requested: {phases:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn no_wait_on_a_transitional_state_reports_busy() {
+    // Anomaly 18: a request accepted with `--no-wait` leaves the VM in a
+    // transitional state, and the very next `--no-wait` operation is an
+    // `InvalidState` naming that state (spec 2.9, wait cell).
+    let mut backend = MockBackend::with_fixture();
+    backend.set_tick_mode(TickMode::Manual);
+    let ops = operations(backend).await;
+
+    let paused = ops
+        .run_vm(
+            VmOp::Pause,
+            &specs(&["web-01"]),
+            WaitPolicy::NoWait,
+            &mut no_progress,
+        )
+        .await;
+    assert!(
+        matches!(
+            success(first(&paused)),
+            OpSuccess::Submitted {
+                pending: Pending::Job(_)
+            }
+        ),
+        "expected the pause to be accepted, got {:?}",
+        first(&paused).result
+    );
+
+    let started = ops
+        .run_vm(
+            VmOp::Start,
+            &specs(&["web-01"]),
+            WaitPolicy::NoWait,
+            &mut no_progress,
+        )
+        .await;
+    match failure(first(&started)) {
+        HyperVError::InvalidState { state, .. } => assert_eq!(*state, VmState::Busy),
+        other => panic!("expected an invalid state, got {other:?}"),
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_guid_is_used_verbatim_and_never_ambiguous() {
     let ops = operations(fixture()).await;
     let id = ok(ops.resolve_vm("00000003-0000-0000-0000-000000000000").await);
@@ -368,6 +471,8 @@ async fn checkpoints_are_created_renamed_and_removed() {
 
 #[tokio::test(start_paused = true)]
 async fn restoring_a_running_vm_is_rejected_before_anything_starts() {
+    // Spec 2.9: restore is `Reject` while Running, and the availability table
+    // refuses it here before the request is sent (design 3.3).
     let ops = operations(fixture()).await;
     let outcome = ops
         .restore_checkpoint(
@@ -378,10 +483,74 @@ async fn restoring_a_running_vm_is_rejected_before_anything_starts() {
         )
         .await;
     match outcome.result {
-        Err(HyperVError::InvalidState { state, .. }) => assert_eq!(state, VmState::Running),
+        Err(HyperVError::InvalidState {
+            state, operation, ..
+        }) => {
+            assert_eq!(state, VmState::Running);
+            // The operation layer's own wording, not the backend's method
+            // name: this error came from the table, not from the defense.
+            assert_eq!(operation, "checkpoint restore");
+        }
         Err(other) => panic!("expected an invalid state, got {other}"),
         Ok(success) => panic!("expected a failure, got {success:?}"),
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_checkpoint_restores_when_the_table_allows_it() {
+    let ops = operations(fixture()).await;
+    // web-02 is Off, where restore is `Ok`; it needs a checkpoint first.
+    let created = ops
+        .create_checkpoint(
+            "web-02",
+            None,
+            WaitPolicy::Wait(Some(Duration::from_secs(30))),
+            &mut no_progress,
+        )
+        .await;
+    let (id, _) = match created.created {
+        Some(pair) => pair,
+        None => panic!("create_checkpoint must report the new checkpoint"),
+    };
+    let outcome = ops
+        .restore_checkpoint(
+            "web-02",
+            &id.to_string(),
+            WaitPolicy::Wait(Some(Duration::from_secs(30))),
+            &mut no_progress,
+        )
+        .await;
+    assert!(
+        matches!(outcome.result, Ok(OpSuccess::Completed { .. })),
+        "restore from Off must run, got {:?}",
+        outcome.result
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn checkpoint_create_is_refused_in_a_state_the_table_rejects() {
+    // `ghost` is Unknown(42): spec 2.9 says ✗, and nothing may be created.
+    let ops = operations(fixture()).await;
+    let outcome = ops
+        .create_checkpoint(
+            "ghost",
+            None,
+            WaitPolicy::Wait(Some(Duration::from_secs(30))),
+            &mut no_progress,
+        )
+        .await;
+    match outcome.result {
+        Err(HyperVError::InvalidState {
+            state, operation, ..
+        }) => {
+            assert_eq!(state, VmState::Unknown(42));
+            assert_eq!(operation, "checkpoint create");
+        }
+        Err(other) => panic!("expected an invalid state, got {other}"),
+        Ok(success) => panic!("expected a failure, got {success:?}"),
+    }
+    let vm = ok(ops.resolve_vm("ghost").await);
+    assert!(ok(ops.handle().list_checkpoints(vm).await).is_empty());
 }
 
 #[tokio::test(start_paused = true)]
