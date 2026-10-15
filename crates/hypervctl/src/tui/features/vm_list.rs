@@ -88,12 +88,7 @@ fn line(
 fn state_style(state: VmState) -> Style {
     match state {
         VmState::Running => Style::new().fg(Color::Green),
-        VmState::Starting
-        | VmState::Stopping
-        | VmState::Saving
-        | VmState::Pausing
-        | VmState::Resuming
-        | VmState::Resetting => Style::new().fg(Color::Yellow),
+        VmState::Starting | VmState::Stopping | VmState::Busy => Style::new().fg(Color::Yellow),
         VmState::Unknown(_) => Style::new().fg(Color::Red),
         _ => Style::new(),
     }

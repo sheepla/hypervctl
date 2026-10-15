@@ -1,6 +1,7 @@
 //! Jobs and the accepted/rejected shape of a mutation.
 
 use std::fmt;
+use std::time::Duration;
 
 use crate::ids::VmId;
 use crate::vm::VmState;
@@ -14,6 +15,15 @@ pub enum Pending {
     Job(JobRef),
     /// No job exists. The operation is finished when the VM reaches the state.
     AwaitState(VmId, VmState),
+    /// A guest reboot was requested via `InitiateReboot`. There is no job and
+    /// no state transition: the VM stays `Running`. Completion is detected by
+    /// the uptime resetting below `uptime_before` (design 3.3). `None` means
+    /// the uptime could not be read before the request, so completion cannot
+    /// be confirmed.
+    AwaitReboot {
+        vm: VmId,
+        uptime_before: Option<Duration>,
+    },
 }
 
 /// Handle to a job the backend started.

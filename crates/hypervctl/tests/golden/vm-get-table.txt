@@ -12,7 +12,7 @@ Maximum memory                 4.0 GB
 Checkpoint count               2
 Configuration file             C:\HyperV\web-01\web-01.vmcx
 Disk 0                         C:\HyperV\web-01\disk.vhdx  (SCSI 0:0)
-Nic 0                          test-external, 00:15:5d:01:02:03, 192.168.1.10
+Nic 0                          test-external, 00:15:5d:01:02:03
 Service: Heartbeat             enabled, Operational
 Service: Time Synchronization  enabled, Operational
 Notes                          -

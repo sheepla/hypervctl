@@ -310,8 +310,6 @@ impl WmiBackend {
                         .collect::<Vec<_>>()
                         .join(":")
                 }),
-                // IP addresses require guest integration; not available via WMI.
-                ip_addresses: Vec::new(),
             })
             .collect())
     }
@@ -474,6 +472,14 @@ fn target_enabled_state(request: RequestedState) -> VmState {
 fn snapshot_service_path(host: &str) -> String {
     format!(
         "\\\\.\\{NAMESPACE}:Msvm_VirtualSystemSnapshotService.CreationClassName=\"Msvm_VirtualSystemSnapshotService\",Name=\"vssnapsvc\",SystemCreationClassName=\"Msvm_ComputerSystem\",SystemName=\"{host}\""
+    )
+}
+
+/// Builds the WMI object path for a VM's shutdown component (design 3.3,
+/// `Msvm_ShutdownComponent`). Four-key composite, like the snapshot service.
+fn shutdown_component_path(host: &str, vm: VmId) -> String {
+    format!(
+        "\\\\.\\{NAMESPACE}:Msvm_ShutdownComponent.CreationClassName=\"Msvm_ShutdownComponent\",Name=\"{vm}\",SystemCreationClassName=\"Msvm_ComputerSystem\",SystemName=\"{host}\""
     )
 }
 
@@ -962,7 +968,7 @@ impl HyperV for WmiBackend {
         Ok(pending)
     }
 
-    fn create_checkpoint(&mut self, vm: VmId, _name: Option<&str>) -> Result<Pending, HyperVError> {
+    fn create_checkpoint(&mut self, vm: VmId) -> Result<Pending, HyperVError> {
         let con = self.connected()?;
         let host = host_name();
         let service = snapshot_service_path(&host);
@@ -980,6 +986,58 @@ impl HyperV for WmiBackend {
             ],
         )?;
         pending_from_method(&out, "CreateSnapshot")
+    }
+
+    fn request_guest_reboot(&mut self, id: VmId) -> Result<Pending, HyperVError> {
+        // Msvm_ShutdownComponent.InitiateReboot: no job, ReturnValue=0
+        // (design 3.3). The component only exists while the VM is Running.
+        let uptime_before = self
+            .summary_row_for(id)?
+            .and_then(|row| row.up_time)
+            .filter(|ms| *ms > 0)
+            .map(Duration::from_millis);
+        let con = self.connected()?;
+        let host = host_name();
+        let component = shutdown_component_path(&host, id);
+        let out = exec_method_with(
+            con,
+            &component,
+            "Msvm_ShutdownComponent",
+            "InitiateReboot",
+            &[],
+        )?;
+        let return_value = return_value(&out)?;
+        if return_value != 0 {
+            // 0x800710DF is the guest-not-ready code seen on real hardware
+            // (M0 item 5, V10).
+            return Err(HyperVError::JobFailed {
+                code: return_value,
+                message: format!("InitiateReboot returned {return_value}"),
+                reason: hypervctl_core::JobFailReason::GuestNotReady,
+                raw: None,
+            });
+        }
+        Ok(Pending::AwaitReboot {
+            vm: id,
+            uptime_before,
+        })
+    }
+
+    fn rename_checkpoint(
+        &mut self,
+        checkpoint: CheckpointId,
+        _name: &str,
+    ) -> Result<Pending, HyperVError> {
+        // V4 (design 3.8.8) is unverified: which WMI method renames a
+        // checkpoint has not been confirmed on real hardware. Until M11-V
+        // verifies it, report a clear error rather than guessing (design
+        // 3.8: "推測で実装しない"). The operation layer already reports the
+        // created checkpoint's id so the user can clean up (design 3.3).
+        let _ = checkpoint;
+        Err(HyperVError::backend(RawError::new(
+            "checkpoint rename is not verified on real hardware yet (M11-V); \
+             the checkpoint was created with the provider's default name",
+        )))
     }
 
     fn restore_checkpoint(
@@ -1547,13 +1605,13 @@ mod tests {
 
     #[test]
     fn every_enabled_state_maps_through_the_m0_table() {
+        assert_eq!(VmState::from_enabled_state(1), VmState::Busy);
         assert_eq!(VmState::from_enabled_state(2), VmState::Running);
         assert_eq!(VmState::from_enabled_state(3), VmState::Off);
         assert_eq!(VmState::from_enabled_state(4), VmState::Stopping);
         assert_eq!(VmState::from_enabled_state(6), VmState::Saved);
         assert_eq!(VmState::from_enabled_state(9), VmState::Paused);
-        assert_eq!(VmState::from_enabled_state(10), VmState::Starting);
-        assert_eq!(VmState::from_enabled_state(1), VmState::Unknown(1));
+        assert_eq!(VmState::from_enabled_state(10), VmState::Busy);
         assert_eq!(VmState::from_enabled_state(42), VmState::Unknown(42));
     }
 

@@ -8,8 +8,11 @@ use crate::vhd::VhdAttachment;
 
 /// Operating state of a VM.
 ///
-/// Stable states are `Running`, `Off`, `Saved` and `Paused`. The remaining
-/// variants are transitional: the VM is moving towards a stable state.
+/// Stable states are `Running`, `Off`, `Saved` and `Paused`. `Starting` and
+/// `Stopping` are transitional. Every other transitional value (Saving,
+/// Pausing, Resuming, Resetting) is collapsed into `Busy`: the goal of those
+/// transitions cannot be told from `EnabledState` alone, and the availability
+/// table treats them all the same (spec 2.9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum VmState {
     Running,
@@ -18,10 +21,9 @@ pub enum VmState {
     Paused,
     Starting,
     Stopping,
-    Saving,
-    Pausing,
-    Resuming,
-    Resetting,
+    /// A transitional state whose goal is not `Starting` or `Stopping` (e.g.
+    /// Saving, Pausing, Resuming, Resetting).
+    Busy,
     /// A value the backend does not know. The raw provider value is kept instead
     /// of being dropped, so it can be reported as `Unknown(raw)`.
     Unknown(u32),
@@ -31,33 +33,26 @@ impl VmState {
     /// Maps Hyper-V's `EnabledState` value to a state.
     ///
     /// The table below is the one verified on real hardware during M0 (design
-    /// document 3.7.1). Value `1` means "enabled but not settled yet" and only
-    /// says that a transition is in progress; without the locale-dependent
-    /// `OtherEnabledState` the target state cannot be told, so it is kept raw.
+    /// document 3.7.1). Values `1`, `4` and `10` are transitional; `1` and
+    /// `10` cannot be told apart from `Starting`/`Stopping` without the
+    /// locale-dependent `OtherEnabledState`, so all three collapse into `Busy`
+    /// per spec 2.9.
     pub const fn from_enabled_state(raw: u32) -> Self {
         match raw {
-            1 => Self::Unknown(1),
+            1 => Self::Busy,
             2 => Self::Running,
             3 => Self::Off,
             4 => Self::Stopping,
             6 => Self::Saved,
             9 => Self::Paused,
-            10 => Self::Starting,
+            10 => Self::Busy,
             other => Self::Unknown(other),
         }
     }
 
     /// `true` while the VM is moving between stable states.
     pub const fn is_transition(self) -> bool {
-        matches!(
-            self,
-            Self::Starting
-                | Self::Stopping
-                | Self::Saving
-                | Self::Pausing
-                | Self::Resuming
-                | Self::Resetting
-        )
+        matches!(self, Self::Starting | Self::Stopping | Self::Busy)
     }
 
     /// The provider value when, and only when, the state is [`VmState::Unknown`].
@@ -78,10 +73,7 @@ impl fmt::Display for VmState {
             Self::Paused => f.write_str("Paused"),
             Self::Starting => f.write_str("Starting"),
             Self::Stopping => f.write_str("Stopping"),
-            Self::Saving => f.write_str("Saving"),
-            Self::Pausing => f.write_str("Pausing"),
-            Self::Resuming => f.write_str("Resuming"),
-            Self::Resetting => f.write_str("Resetting"),
+            Self::Busy => f.write_str("Busy"),
             Self::Unknown(raw) => write!(f, "Unknown({raw})"),
         }
     }
@@ -130,7 +122,6 @@ pub struct NicConfig {
     /// Name of the connected switch; `None` when the adapter is disconnected.
     pub switch_name: Option<String>,
     pub mac_address: Option<String>,
-    pub ip_addresses: Vec<std::net::IpAddr>,
 }
 
 /// Guest integration service as reported for `vm get`.
@@ -156,17 +147,17 @@ mod tests {
 
     #[test]
     fn maps_the_values_verified_in_m0() {
+        assert_eq!(VmState::from_enabled_state(1), VmState::Busy);
         assert_eq!(VmState::from_enabled_state(2), VmState::Running);
         assert_eq!(VmState::from_enabled_state(3), VmState::Off);
         assert_eq!(VmState::from_enabled_state(4), VmState::Stopping);
         assert_eq!(VmState::from_enabled_state(6), VmState::Saved);
         assert_eq!(VmState::from_enabled_state(9), VmState::Paused);
-        assert_eq!(VmState::from_enabled_state(10), VmState::Starting);
+        assert_eq!(VmState::from_enabled_state(10), VmState::Busy);
     }
 
     #[test]
     fn keeps_unknown_values_instead_of_failing() {
-        assert_eq!(VmState::from_enabled_state(1), VmState::Unknown(1));
         assert_eq!(VmState::from_enabled_state(42), VmState::Unknown(42));
         assert_eq!(VmState::Unknown(42).raw_if_unknown(), Some(42));
         assert_eq!(VmState::Running.raw_if_unknown(), None);
@@ -175,14 +166,7 @@ mod tests {
 
     #[test]
     fn marks_transitional_states() {
-        for state in [
-            VmState::Starting,
-            VmState::Stopping,
-            VmState::Saving,
-            VmState::Pausing,
-            VmState::Resuming,
-            VmState::Resetting,
-        ] {
+        for state in [VmState::Starting, VmState::Stopping, VmState::Busy] {
             assert!(state.is_transition(), "{state} should be transitional");
         }
         for state in [

@@ -38,10 +38,7 @@ fn state_parts(state: VmState) -> Parts {
         VmState::Paused => known("Paused", "paused"),
         VmState::Starting => known("Starting", "starting"),
         VmState::Stopping => known("Stopping", "stopping"),
-        VmState::Saving => known("Saving", "saving"),
-        VmState::Pausing => known("Pausing", "pausing"),
-        VmState::Resuming => known("Resuming", "resuming"),
-        VmState::Resetting => known("Resetting", "resetting"),
+        VmState::Busy => known("Busy", "busy"),
         VmState::Unknown(raw) => unknown(raw),
     }
 }
@@ -234,7 +231,6 @@ pub struct DiskView {
 pub struct NicView {
     pub switch_name: Option<String>,
     pub mac_address: Option<String>,
-    pub ip_addresses: Vec<String>,
 }
 
 impl From<&NicConfig> for NicView {
@@ -242,7 +238,6 @@ impl From<&NicConfig> for NicView {
         Self {
             switch_name: nic.switch_name.clone(),
             mac_address: nic.mac_address.clone(),
-            ip_addresses: nic.ip_addresses.iter().map(|ip| ip.to_string()).collect(),
         }
     }
 }
@@ -438,9 +433,6 @@ fn nic_label(nic: &NicView) -> String {
         .unwrap_or_else(|| "not connected".to_string())];
     if let Some(mac) = &nic.mac_address {
         parts.push(mac.clone());
-    }
-    if !nic.ip_addresses.is_empty() {
-        parts.push(nic.ip_addresses.join(", "));
     }
     parts.join(", ")
 }

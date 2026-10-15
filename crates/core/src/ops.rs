@@ -4,11 +4,13 @@
 //! The CLI and the TUI both go through this layer, so waiting, de-duplication
 //! and error classification are written once, here.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::time::Duration;
 
 use tokio::time::{sleep, sleep_until, Instant};
 
+use crate::availability::{availability, Availability, OpKind};
 use crate::checkpoint::Checkpoint;
 use crate::error::{HyperVError, RawError};
 use crate::handle::BackendHandle;
@@ -47,6 +49,9 @@ const JOB_POLL: Duration = Duration::from_millis(200);
 /// How often the state is polled while waiting for a state (design 3.3).
 const STATE_POLL: Duration = Duration::from_millis(500);
 
+/// The minimum uptime drop that counts as a reboot (design 3.3).
+const REBOOT_UPTIME_SLACK: Duration = Duration::from_secs(2);
+
 /// Where an operation is, for spinners and progress bars (design 3.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
@@ -81,6 +86,9 @@ pub struct OpOutcome {
     pub target: String,
     /// The entity the operation acted on, once the target resolved (design 4.4).
     pub id: Option<OpId>,
+    /// Set only for checkpoint create: the new checkpoint's id and name
+    /// after the optional rename (design 3.3).
+    pub created: Option<(CheckpointId, String)>,
     pub result: Result<OpSuccess, HyperVError>,
 }
 
@@ -112,6 +120,20 @@ impl VmOp {
     pub const fn is_restart(self) -> bool {
         matches!(self, Self::Restart | Self::RestartForce)
     }
+
+    /// The corresponding availability-table operation.
+    pub const fn op_kind(self) -> OpKind {
+        match self {
+            Self::Start => OpKind::Start,
+            Self::Stop => OpKind::Stop,
+            Self::StopForce => OpKind::StopForce,
+            Self::Restart => OpKind::Restart,
+            Self::RestartForce => OpKind::RestartForce,
+            Self::Save => OpKind::Save,
+            Self::Pause => OpKind::Pause,
+            Self::Resume => OpKind::Resume,
+        }
+    }
 }
 
 impl fmt::Display for VmOp {
@@ -129,29 +151,6 @@ impl fmt::Display for VmOp {
     }
 }
 
-/// What to do in a state that has settled.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Plan {
-    /// The goal is already met: report success without touching the backend.
-    Already,
-    /// Send this request and watch for this state.
-    Request(RequestedState, VmState),
-}
-
-/// The state a transitional state is heading towards. Hyper-V's transitional
-/// values each point at one stable state, which is enough to answer a request
-/// that arrives while a transition is running (design 3.7.1).
-fn direction(state: VmState) -> Option<VmState> {
-    use VmState::*;
-    match state {
-        Starting | Resuming | Resetting => Some(Running),
-        Stopping => Some(Off),
-        Saving => Some(Saved),
-        Pausing => Some(Paused),
-        _ => None,
-    }
-}
-
 /// `start` resumes a saved or paused VM rather than starting it (spec 2.3).
 fn start_request(state: VmState) -> RequestedState {
     match state {
@@ -160,38 +159,40 @@ fn start_request(state: VmState) -> RequestedState {
     }
 }
 
-/// Decides between "nothing to do", "send this" and "not possible here"
-/// (spec 2.9). Restart never reaches this function: it runs its own sequence.
-fn plan(op: VmOp, id: VmId, state: VmState) -> Result<Plan, HyperVError> {
-    use RequestedState::*;
-    use VmState::*;
-
-    let (goal, mut request, valid_from): (VmState, RequestedState, &[VmState]) = match op {
-        VmOp::Start => (Running, Start, &[Off, Saved, Paused]),
-        VmOp::Stop => (Off, ShutDown, &[Running]),
-        VmOp::StopForce => (Off, TurnOff, &[Running, Saved, Paused]),
-        VmOp::Save => (Saved, Save, &[Running, Paused]),
-        VmOp::Pause => (Paused, Pause, &[Running]),
-        VmOp::Resume => (Running, Resume, &[Paused]),
-        // Restart runs through `restart` instead; the arm keeps `plan` total.
-        VmOp::Restart | VmOp::RestartForce => (Running, Start, &[Off, Saved, Paused]),
-    };
-
-    if state == goal {
-        return Ok(Plan::Already);
+/// The goal state of a request, for de-duplication and waiting.
+fn goal_of(request: RequestedState) -> VmState {
+    match request {
+        RequestedState::Start | RequestedState::Resume | RequestedState::Reset => VmState::Running,
+        RequestedState::ShutDown | RequestedState::TurnOff => VmState::Off,
+        RequestedState::Save => VmState::Saved,
+        RequestedState::Pause => VmState::Paused,
     }
-    if !valid_from.contains(&state) {
-        return Err(HyperVError::InvalidState {
+}
+
+/// The request behind a settled state for one operation, or `Already` /
+/// `InvalidState` according to the availability table (design 3.3).
+fn request_for(op: VmOp, id: VmId, state: VmState) -> Result<Option<RequestedState>, HyperVError> {
+    match availability(op.op_kind(), state) {
+        Availability::Ok => {
+            let request = match op {
+                VmOp::Start => start_request(state),
+                VmOp::Stop => RequestedState::ShutDown,
+                VmOp::StopForce => RequestedState::TurnOff,
+                VmOp::Restart | VmOp::RestartForce => RequestedState::Reset,
+                VmOp::Save => RequestedState::Save,
+                VmOp::Pause => RequestedState::Pause,
+                VmOp::Resume => RequestedState::Resume,
+            };
+            Ok(Some(request))
+        }
+        Availability::Already => Ok(None),
+        Availability::Wait | Availability::Reject => Err(HyperVError::InvalidState {
             target: Some(id),
             state,
             operation: op.to_string(),
             raw: None,
-        });
+        }),
     }
-    if op == VmOp::Start {
-        request = start_request(state);
-    }
-    Ok(Plan::Request(request, goal))
 }
 
 /// Per-operation state: the target as typed, the deadline, and who hears about
@@ -419,17 +420,19 @@ impl Operations {
             outcomes.push(OpOutcome {
                 target: spec.clone(),
                 id,
+                created: None,
                 result,
             });
         }
         outcomes
     }
 
-    /// Creates a checkpoint and waits for it when the policy says so.
+    /// Creates a checkpoint, identifies it by set difference, and optionally
+    /// renames it (design 3.3).
     ///
-    /// What the backend reports for a new checkpoint carries no identifier, so
-    /// the outcome has none either (design 4.4: include it only when it can be
-    /// had).
+    /// The backend's `create_checkpoint` carries no identifier, so the caller
+    /// snapshots the id set before and after and takes the difference. With
+    /// `--no-wait` only the request is submitted and no id is returned.
     pub async fn create_checkpoint(
         &self,
         vm: &str,
@@ -439,24 +442,167 @@ impl Operations {
     ) -> OpOutcome {
         let mut ctx = Ctx::new(vm, wait, on_progress);
         notify(&mut ctx, Phase::Resolving, None);
+        let mut created = None;
         let result = match self.resolve_vm(vm).await {
             Err(error) => Err(error),
             Ok(id) => {
+                // Snapshot the id set before the request (design 3.3 step 1).
+                let before: HashSet<CheckpointId> = match self.handle.list_checkpoints(id).await {
+                    Ok(list) => list.into_iter().map(|cp| cp.id).collect(),
+                    Err(error) => {
+                        return OpOutcome {
+                            target: vm.to_string(),
+                            id: Some(OpId::Vm(id)),
+                            created: None,
+                            result: Err(error),
+                        }
+                    }
+                };
                 notify(&mut ctx, Phase::Requesting, None);
-                match self.handle.create_checkpoint(id, name).await {
-                    Err(error) => Err(error),
-                    Ok(pending) => self.finish(id, pending, None, &mut ctx).await,
+                let pending = match self.handle.create_checkpoint(id).await {
+                    Ok(pending) => pending,
+                    Err(error) => {
+                        return OpOutcome {
+                            target: vm.to_string(),
+                            id: Some(OpId::Vm(id)),
+                            created: None,
+                            result: Err(error),
+                        }
+                    }
+                };
+                if ctx.wait == WaitPolicy::NoWait {
+                    return OpOutcome {
+                        target: vm.to_string(),
+                        id: Some(OpId::Vm(id)),
+                        created: None,
+                        result: Ok(OpSuccess::Submitted { pending }),
+                    };
                 }
+                notify(&mut ctx, Phase::Waiting, None);
+                // Wait for the job to finish before reading the new set.
+                let finished = match self.await_pending(id, pending, None, &mut ctx).await {
+                    Ok(state) => state,
+                    Err(error) => {
+                        return OpOutcome {
+                            target: vm.to_string(),
+                            id: Some(OpId::Vm(id)),
+                            created: None,
+                            result: Err(error),
+                        }
+                    }
+                };
+                // Step 3: set difference.
+                let after = match self.handle.list_checkpoints(id).await {
+                    Ok(list) => list,
+                    Err(error) => {
+                        return OpOutcome {
+                            target: vm.to_string(),
+                            id: Some(OpId::Vm(id)),
+                            created: None,
+                            result: Err(error),
+                        }
+                    }
+                };
+                let new: Vec<&Checkpoint> =
+                    after.iter().filter(|cp| !before.contains(&cp.id)).collect();
+                let (new_id, new_name) = match new.as_slice() {
+                    [one] => (one.id, one.name.clone()),
+                    // Could not tell which checkpoint was created: do not
+                    // guess (design 3.3 step 3).
+                    _ => {
+                        return OpOutcome {
+                            target: vm.to_string(),
+                            id: Some(OpId::Vm(id)),
+                            created: None,
+                            result: Err(HyperVError::backend(RawError::new(
+                                "could not identify the created checkpoint",
+                            ))),
+                        }
+                    }
+                };
+                // Step 4: optional rename.
+                let final_name = match name {
+                    None => new_name,
+                    Some(wanted) => {
+                        notify(&mut ctx, Phase::Requesting, None);
+                        match self.handle.rename_checkpoint(new_id, wanted).await {
+                            Ok(rename_pending) => {
+                                match self.await_pending(id, rename_pending, None, &mut ctx).await {
+                                    Ok(_) => wanted.to_string(),
+                                    Err(error) => {
+                                        return OpOutcome {
+                                            target: vm.to_string(),
+                                            id: Some(OpId::Vm(id)),
+                                            created: Some((new_id, new_name)),
+                                            result: Err(error),
+                                        }
+                                    }
+                                }
+                            }
+                            // The checkpoint exists but the rename failed:
+                            // report the id so the user can clean up
+                            // (design 3.3 step 4).
+                            Err(error) => {
+                                return OpOutcome {
+                                    target: vm.to_string(),
+                                    id: Some(OpId::Vm(id)),
+                                    created: Some((new_id, new_name)),
+                                    result: Err(error),
+                                }
+                            }
+                        }
+                    }
+                };
+                created = Some((new_id, final_name.clone()));
+                Ok(OpSuccess::Completed {
+                    state: finished,
+                    elapsed: ctx.started.elapsed(),
+                })
             }
         };
         OpOutcome {
             target: vm.to_string(),
             id: None,
+            created,
             result,
         }
     }
 
-    /// Restores a checkpoint of a VM that must not be running (M0 item 6).
+    /// Renames a checkpoint. The VM is only needed to resolve the checkpoint.
+    pub async fn rename_checkpoint(
+        &self,
+        vm: &str,
+        checkpoint: &str,
+        name: &str,
+        wait: WaitPolicy,
+        on_progress: &mut (dyn FnMut(Progress) + Send),
+    ) -> OpOutcome {
+        let mut ctx = Ctx::new(vm, wait, on_progress);
+        notify(&mut ctx, Phase::Resolving, None);
+        let mut id = None;
+        let result = match self.resolve_vm(vm).await {
+            Err(error) => Err(error),
+            Ok(found) => match self.resolve_checkpoint(found, checkpoint).await {
+                Err(error) => Err(error),
+                Ok(target) => {
+                    id = Some(OpId::Checkpoint(target));
+                    notify(&mut ctx, Phase::Requesting, None);
+                    match self.handle.rename_checkpoint(target, name).await {
+                        Err(error) => Err(error),
+                        Ok(pending) => self.finish(found, pending, None, &mut ctx).await,
+                    }
+                }
+            },
+        };
+        OpOutcome {
+            target: checkpoint.to_string(),
+            id,
+            created: None,
+            result,
+        }
+    }
+
+    /// Restores a checkpoint of a VM that must not be running (spec 2.4).
     pub async fn restore_checkpoint(
         &self,
         vm: &str,
@@ -484,6 +630,7 @@ impl Operations {
         OpOutcome {
             target: checkpoint.to_string(),
             id,
+            created: None,
             result,
         }
     }
@@ -517,6 +664,7 @@ impl Operations {
         OpOutcome {
             target: checkpoint.to_string(),
             id,
+            created: None,
             result,
         }
     }
@@ -524,6 +672,15 @@ impl Operations {
     /// Reads the state of one VM.
     async fn state(&self, id: VmId) -> Result<VmState, HyperVError> {
         Ok(self.handle.get_vm(id).await?.summary.state)
+    }
+
+    /// Reads the uptime of one VM, if it reports one.
+    async fn uptime(&self, id: VmId) -> Option<Duration> {
+        self.handle
+            .get_vm(id)
+            .await
+            .ok()
+            .and_then(|vm| vm.summary.uptime)
     }
 
     /// Lets a transition in flight finish, so the decision below is made on a
@@ -553,22 +710,21 @@ impl Operations {
         ctx: &mut Ctx<'_>,
     ) -> Result<OpSuccess, HyperVError> {
         let observed = self.settle(id, ctx).await?;
-        // While not waiting, a transition still says where the VM is going, and
-        // that is what the request has to be judged against.
-        let effective = direction(observed).unwrap_or(observed);
-        let (request, goal) = match plan(op, id, effective)? {
-            Plan::Already => return Ok(OpSuccess::Already { state: observed }),
-            Plan::Request(request, goal) => (request, goal),
+        let request = match request_for(op, id, observed)? {
+            Some(request) => request,
+            None => return Ok(OpSuccess::Already { state: observed }),
         };
+        let goal = goal_of(request);
         self.request_and_wait(id, request, goal, observed, ctx)
             .await
     }
 
-    /// Restarts a VM: shut down, confirm it stopped, start it again. The whole
-    /// sequence shares one deadline (spec 2.3 note, design 3.3).
+    /// Restarts a VM via `InitiateReboot` (spec 2.3 note, design 3.3).
     ///
-    /// `force` replaces the sequence with a single reset. A VM that is not
-    /// running is only started: there is nothing to shut down first.
+    /// The VM stays Running throughout, so completion is detected by the
+    /// uptime resetting. `force` uses `Reset` instead and waits for Running.
+    /// A VM that is not Running is not restarted: the availability table
+    /// only allows restart from Running.
     async fn restart(
         &self,
         id: VmId,
@@ -576,25 +732,63 @@ impl Operations {
         ctx: &mut Ctx<'_>,
     ) -> Result<OpSuccess, HyperVError> {
         let observed = self.settle(id, ctx).await?;
-        let effective = direction(observed).unwrap_or(observed);
-
-        if effective == VmState::Running && !force {
-            let outcome = self
-                .request_and_wait(id, RequestedState::ShutDown, VmState::Off, observed, ctx)
-                .await?;
-            if matches!(outcome, OpSuccess::Submitted { .. }) {
-                // `--no-wait` submits the first step and stops there.
-                return Ok(outcome);
+        // `restart --force` goes through the Reset request, which the
+        // availability table already gated on Running.
+        if force {
+            let request = match request_for(VmOp::RestartForce, id, observed)? {
+                Some(request) => request,
+                None => return Ok(OpSuccess::Already { state: observed }),
+            };
+            let goal = goal_of(request);
+            return self
+                .request_and_wait(id, request, goal, observed, ctx)
+                .await;
+        }
+        // Non-force restart: only from Running (availability table).
+        match availability(OpKind::Restart, observed) {
+            Availability::Ok => {}
+            Availability::Already => return Ok(OpSuccess::Already { state: observed }),
+            Availability::Wait | Availability::Reject => {
+                return Err(HyperVError::InvalidState {
+                    target: Some(id),
+                    state: observed,
+                    operation: VmOp::Restart.to_string(),
+                    raw: None,
+                });
             }
         }
-
-        if force && effective == VmState::Running {
-            self.request_and_wait(id, RequestedState::Reset, VmState::Running, observed, ctx)
-                .await
+        // Record the uptime before the request (design 3.3).
+        let uptime_before = if ctx.wait == WaitPolicy::NoWait {
+            None
         } else {
-            let request = start_request(effective);
-            self.request_and_wait(id, request, VmState::Running, effective, ctx)
-                .await
+            self.uptime(id).await
+        };
+        notify(ctx, Phase::Requesting, None);
+        let pending = self.handle.request_guest_reboot(id).await?;
+        match pending {
+            Pending::AwaitReboot {
+                uptime_before: reported,
+                ..
+            } => {
+                let before = uptime_before.or(reported);
+                if ctx.wait == WaitPolicy::NoWait {
+                    return Ok(OpSuccess::Submitted {
+                        pending: Pending::AwaitReboot {
+                            vm: id,
+                            uptime_before: before,
+                        },
+                    });
+                }
+                notify(ctx, Phase::Waiting, None);
+                let state = self.await_reboot(id, before, ctx).await?;
+                Ok(OpSuccess::Completed {
+                    state,
+                    elapsed: ctx.started.elapsed(),
+                })
+            }
+            // A backend that answers with a job or a state follows the
+            // normal path.
+            other => self.finish(id, other, Some(VmState::Running), ctx).await,
         }
     }
 
@@ -672,6 +866,9 @@ impl Operations {
             },
             Pending::AwaitState(target, goal) => self.await_state(target, goal, ctx).await,
             Pending::Job(job) => self.await_job(id, job, goal, ctx).await,
+            Pending::AwaitReboot { uptime_before, .. } => {
+                self.await_reboot(id, uptime_before, ctx).await
+            }
         }
     }
 
@@ -692,6 +889,41 @@ impl Operations {
             notify(ctx, Phase::Waiting, None);
             sleep_for(STATE_POLL, ctx.deadline).await;
             observed = self.state(id).await?;
+        }
+    }
+
+    /// Waits for a guest reboot to complete, detected by the uptime resetting
+    /// (design 3.3). `uptime_before` is the uptime observed just before the
+    /// request; `None` means completion cannot be confirmed.
+    async fn await_reboot(
+        &self,
+        id: VmId,
+        uptime_before: Option<Duration>,
+        ctx: &mut Ctx<'_>,
+    ) -> Result<VmState, HyperVError> {
+        let before = match uptime_before {
+            Some(before) => before,
+            None => {
+                // Cannot confirm completion; the request was accepted.
+                return Ok(VmState::Running);
+            }
+        };
+        loop {
+            if timed_out(ctx) {
+                return Err(self.timeout_error(id, VmState::Running, ctx).await);
+            }
+            notify(ctx, Phase::Waiting, None);
+            sleep_for(STATE_POLL, ctx.deadline).await;
+            // The elapsed time since the request started bounds the
+            // expected uptime if no reboot happened.
+            let elapsed = ctx.started.elapsed();
+            if let Some(current) = self.uptime(id).await {
+                // A reboot resets the uptime; anything below the old value
+                // plus elapsed minus slack means the guest rebooted.
+                if current + REBOOT_UPTIME_SLACK < before + elapsed {
+                    return Ok(VmState::Running);
+                }
+            }
         }
     }
 
@@ -723,6 +955,7 @@ impl Operations {
                     return Err(HyperVError::JobFailed {
                         code,
                         message,
+                        reason: crate::error::JobFailReason::Other,
                         raw: None,
                     });
                 }

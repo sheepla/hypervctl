@@ -76,10 +76,18 @@ impl HyperV for StreamingBackend {
         Err(unused())
     }
 
-    fn create_checkpoint(
+    fn request_guest_reboot(&mut self, _id: VmId) -> Result<Pending, HyperVError> {
+        Err(unused())
+    }
+
+    fn create_checkpoint(&mut self, _vm: VmId) -> Result<Pending, HyperVError> {
+        Err(unused())
+    }
+
+    fn rename_checkpoint(
         &mut self,
-        _vm: VmId,
-        _name: Option<&str>,
+        _checkpoint: CheckpointId,
+        _name: &str,
     ) -> Result<Pending, HyperVError> {
         Err(unused())
     }

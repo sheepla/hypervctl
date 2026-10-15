@@ -331,9 +331,7 @@ fn checkpoint_create_list_and_remove_round_trip() {
     }
 
     let before = backend.list_checkpoints(id).expect("list_checkpoints");
-    let created = backend
-        .create_checkpoint(id, None)
-        .expect("create_checkpoint");
+    let created = backend.create_checkpoint(id).expect("create_checkpoint");
     let job = match created {
         hypervctl_core::Pending::Job(job) => job,
         other => panic!("CreateSnapshot should start a job, got {other:?}"),

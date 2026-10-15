@@ -85,7 +85,23 @@ pub trait HyperV {
         request: RequestedState,
     ) -> Result<Pending, HyperVError>;
 
-    fn create_checkpoint(&mut self, vm: VmId, name: Option<&str>) -> Result<Pending, HyperVError>;
+    /// Asks the guest to reboot via `Msvm_ShutdownComponent.InitiateReboot`.
+    ///
+    /// Returns `Pending::AwaitReboot`: there is no job and no state
+    /// transition, so completion is detected by the uptime resetting
+    /// (design 3.3).
+    fn request_guest_reboot(&mut self, id: VmId) -> Result<Pending, HyperVError>;
+
+    /// Creates a checkpoint with the provider's default name. The caller
+    /// identifies the new checkpoint by set difference and renames it if
+    /// needed (design 3.3).
+    fn create_checkpoint(&mut self, vm: VmId) -> Result<Pending, HyperVError>;
+
+    fn rename_checkpoint(
+        &mut self,
+        checkpoint: CheckpointId,
+        name: &str,
+    ) -> Result<Pending, HyperVError>;
 
     fn restore_checkpoint(
         &mut self,
@@ -163,10 +179,18 @@ mod tests {
             Err(HyperVError::backend(crate::error::RawError::new("stub")))
         }
 
-        fn create_checkpoint(
+        fn request_guest_reboot(&mut self, _id: VmId) -> Result<Pending, HyperVError> {
+            Err(HyperVError::backend(crate::error::RawError::new("stub")))
+        }
+
+        fn create_checkpoint(&mut self, _vm: VmId) -> Result<Pending, HyperVError> {
+            Err(HyperVError::backend(crate::error::RawError::new("stub")))
+        }
+
+        fn rename_checkpoint(
             &mut self,
-            _vm: VmId,
-            _name: Option<&str>,
+            _checkpoint: CheckpointId,
+            _name: &str,
         ) -> Result<Pending, HyperVError> {
             Err(HyperVError::backend(crate::error::RawError::new("stub")))
         }

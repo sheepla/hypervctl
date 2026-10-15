@@ -83,14 +83,26 @@ impl BackendHandle {
             .await
     }
 
-    pub async fn create_checkpoint(
+    pub async fn request_guest_reboot(&self, id: VmId) -> Result<Pending, HyperVError> {
+        self.call(|tx| Command::RequestGuestReboot { id, tx }).await
+    }
+
+    pub async fn create_checkpoint(&self, vm: VmId) -> Result<Pending, HyperVError> {
+        self.call(|tx| Command::CreateCheckpoint { vm, tx }).await
+    }
+
+    pub async fn rename_checkpoint(
         &self,
-        vm: VmId,
-        name: Option<&str>,
+        checkpoint: CheckpointId,
+        name: &str,
     ) -> Result<Pending, HyperVError> {
-        let name = name.map(str::to_string);
-        self.call(|tx| Command::CreateCheckpoint { vm, name, tx })
-            .await
+        let name = name.to_string();
+        self.call(|tx| Command::RenameCheckpoint {
+            checkpoint,
+            name,
+            tx,
+        })
+        .await
     }
 
     pub async fn restore_checkpoint(

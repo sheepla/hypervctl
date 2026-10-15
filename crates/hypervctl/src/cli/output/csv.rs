@@ -151,7 +151,7 @@ mod tests {
         let value = json!({
             "name": "web-01",
             "memory": {"startup_bytes": 1024, "min_bytes": null},
-            "nics": [{"switch_name": "lan", "ip_addresses": ["10.0.0.1", "10.0.0.2"]}],
+            "nics": [{"switch_name": "lan", "mac_address": "00:15:5d:01:02:03"}],
             "disks": [],
             "tags": ["a", "b"],
             "empty_tags": [],
@@ -170,7 +170,7 @@ mod tests {
                 "memory_startup_bytes=1024",
                 "memory_min_bytes=",
                 "nics_0_switch_name=lan",
-                "nics_0_ip_addresses=10.0.0.1, 10.0.0.2",
+                "nics_0_mac_address=00:15:5d:01:02:03",
                 "tags=a, b",
             ]
         );

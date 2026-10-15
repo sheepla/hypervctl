@@ -215,6 +215,7 @@ mod tests {
         OpOutcome {
             target: target.to_string(),
             id: Some(OpId::Vm(VmId::new(Uuid::from_u128(0x1 << 96)))),
+            created: None,
             result,
         }
     }
@@ -272,6 +273,7 @@ mod tests {
             OpOutcome {
                 target: "nope".to_string(),
                 id: None,
+                created: None,
                 result: Err(HyperVError::NotFound {
                     kind: hypervctl_core::TargetKind::Vm,
                     specified: "nope".to_string(),
@@ -304,6 +306,7 @@ mod tests {
         let outcomes = vec![OpOutcome {
             target: "nope".to_string(),
             id: None,
+            created: None,
             result: Err(HyperVError::NotFound {
                 kind: hypervctl_core::TargetKind::Vm,
                 specified: "nope".to_string(),
@@ -349,11 +352,13 @@ mod tests {
             OpOutcome {
                 target: "gone".to_string(),
                 id: None,
+                created: None,
                 result: Err(not_found()),
             },
             OpOutcome {
                 target: "gone2".to_string(),
                 id: None,
+                created: None,
                 result: Err(not_found()),
             },
         ];
@@ -429,6 +434,7 @@ mod tests {
             id: Some(OpId::Checkpoint(CheckpointId::new(Uuid::from_u128(
                 0x101 << 96,
             )))),
+            created: None,
             result: Ok(completed()),
         };
         let found = report(vec![outcome], |_| "restored".to_string(), 0);

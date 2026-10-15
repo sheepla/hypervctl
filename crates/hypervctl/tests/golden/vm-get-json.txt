@@ -25,10 +25,7 @@
   "nics": [
     {
       "switch_name": "test-external",
-      "mac_address": "00:15:5d:01:02:03",
-      "ip_addresses": [
-        "192.168.1.10"
-      ]
+      "mac_address": "00:15:5d:01:02:03"
     }
   ],
   "checkpoint_count": 2,

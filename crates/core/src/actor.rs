@@ -53,9 +53,17 @@ pub(crate) enum Command {
         request: RequestedState,
         tx: Reply<Pending>,
     },
+    RequestGuestReboot {
+        id: VmId,
+        tx: Reply<Pending>,
+    },
     CreateCheckpoint {
         vm: VmId,
-        name: Option<String>,
+        tx: Reply<Pending>,
+    },
+    RenameCheckpoint {
+        checkpoint: CheckpointId,
+        name: String,
         tx: Reply<Pending>,
     },
     RestoreCheckpoint {
@@ -103,8 +111,18 @@ impl Command {
             Command::RequestVmState { id, request, tx } => {
                 let _ = tx.send(backend.request_vm_state(id, request));
             }
-            Command::CreateCheckpoint { vm, name, tx } => {
-                let _ = tx.send(backend.create_checkpoint(vm, name.as_deref()));
+            Command::RequestGuestReboot { id, tx } => {
+                let _ = tx.send(backend.request_guest_reboot(id));
+            }
+            Command::CreateCheckpoint { vm, tx } => {
+                let _ = tx.send(backend.create_checkpoint(vm));
+            }
+            Command::RenameCheckpoint {
+                checkpoint,
+                name,
+                tx,
+            } => {
+                let _ = tx.send(backend.rename_checkpoint(checkpoint, &name));
             }
             Command::RestoreCheckpoint { vm, checkpoint, tx } => {
                 let _ = tx.send(backend.restore_checkpoint(vm, checkpoint));

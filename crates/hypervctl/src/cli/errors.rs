@@ -205,6 +205,7 @@ mod tests {
         HyperVError::JobFailed {
             code: 32770,
             message: "not supported".to_string(),
+            reason: hypervctl_core::JobFailReason::Other,
             raw: None,
         }
     }

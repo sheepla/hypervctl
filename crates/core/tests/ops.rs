@@ -212,7 +212,7 @@ async fn one_failure_does_not_stop_the_remaining_targets() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn restart_shuts_down_waits_for_off_and_starts_again() {
+async fn restart_requests_a_guest_reboot_and_completes_when_the_uptime_resets() {
     let ops = operations(fixture()).await;
     let mut phases: Vec<Phase> = Vec::new();
     let mut record = |progress: Progress| phases.push(progress.phase);
@@ -237,9 +237,15 @@ async fn restart_shuts_down_waits_for_off_and_starts_again() {
         .filter(|phase| **phase == Phase::Requesting)
         .count();
     assert_eq!(
-        requests, 2,
-        "restart must ask for the shutdown and then for the start"
+        requests, 1,
+        "restart must send exactly one InitiateReboot request"
     );
+    // The mock reset the uptime after the reboot settled.
+    let vm = ok(ops
+        .handle()
+        .get_vm(ok(ops.resolve_vm("web-01").await))
+        .await);
+    assert_eq!(vm.summary.uptime, Some(Duration::ZERO));
 }
 
 #[tokio::test(start_paused = true)]
@@ -305,29 +311,52 @@ async fn a_guid_is_used_verbatim_and_never_ambiguous() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn checkpoints_are_created_and_removed_by_name() {
+async fn checkpoints_are_created_renamed_and_removed() {
     let ops = operations(fixture()).await;
     let vm = ok(ops.resolve_vm("web-02").await);
 
-    let created = ops
+    // Create without a name; the operation layer renames it afterwards.
+    let outcome = ops
         .create_checkpoint(
             "web-02",
             Some("before-work"),
             WaitPolicy::Wait(Some(Duration::from_secs(30))),
             &mut no_progress,
         )
-        .await
-        .result;
-    assert!(matches!(created, Ok(OpSuccess::Completed { .. })));
+        .await;
+    assert!(matches!(outcome.result, Ok(OpSuccess::Completed { .. })));
+    let created = match outcome.created {
+        Some(pair) => pair,
+        None => panic!("create_checkpoint must report the new checkpoint"),
+    };
+    assert_eq!(created.1, "before-work");
 
     let listed = ok(ops.handle().list_checkpoints(vm).await);
     let name = listed.first().map(|checkpoint| checkpoint.name.clone());
     assert_eq!(name, Some("before-work".to_string()));
 
+    // Rename an existing checkpoint.
+    let renamed = ops
+        .rename_checkpoint(
+            "web-02",
+            "before-work",
+            "renamed",
+            WaitPolicy::Wait(Some(Duration::from_secs(30))),
+            &mut no_progress,
+        )
+        .await
+        .result;
+    assert!(matches!(renamed, Ok(OpSuccess::Completed { .. })));
+    let listed = ok(ops.handle().list_checkpoints(vm).await);
+    assert_eq!(
+        listed.first().map(|checkpoint| checkpoint.name.as_str()),
+        Some("renamed")
+    );
+
     let removed = ops
         .remove_checkpoint(
             "web-02",
-            "before-work",
+            "renamed",
             WaitPolicy::Wait(Some(Duration::from_secs(30))),
             &mut no_progress,
         )

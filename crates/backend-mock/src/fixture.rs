@@ -2,7 +2,6 @@
 //! (including an unknown one and two with the same name), a checkpoint tree,
 //! switches and one VHD (design 3.5).
 
-use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -64,7 +63,6 @@ fn vm(
             vec![NicConfig {
                 switch_name: Some("test-external".to_string()),
                 mac_address: Some("00:15:5d:01:02:03".to_string()),
-                ip_addresses: vec![IpAddr::from([192, 168, 1, 10])],
             }]
         } else {
             Vec::new()

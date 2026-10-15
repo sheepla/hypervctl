@@ -78,6 +78,29 @@ impl fmt::Display for UnavailableReason {
     }
 }
 
+/// The classified cause of a failed Hyper-V job, shown as a hint (spec 2.12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum JobFailReason {
+    /// `0x800710DF`: the guest did not accept the request (integration
+    /// services not running).
+    GuestNotReady,
+    /// `0x8007000E`: the host ran out of free memory.
+    HostOutOfMemory,
+    /// Anything else; only the raw message (`-v`) explains further.
+    #[default]
+    Other,
+}
+
+impl fmt::Display for JobFailReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::GuestNotReady => "guest_not_ready",
+            Self::HostOutOfMemory => "host_out_of_memory",
+            Self::Other => "other",
+        })
+    }
+}
+
 /// An error, classified for the frontend.
 #[derive(Debug, Clone, Error, PartialEq)]
 pub enum HyperVError {
@@ -124,6 +147,7 @@ pub enum HyperVError {
     JobFailed {
         code: u32,
         message: String,
+        reason: JobFailReason,
         raw: Option<RawError>,
     },
 
@@ -259,9 +283,21 @@ mod tests {
         let error = HyperVError::JobFailed {
             code: 32770,
             message: "not supported".to_string(),
+            reason: JobFailReason::Other,
             raw: None,
         };
         assert_eq!(error.to_string(), "Hyper-V job 32770 failed: not supported");
+    }
+
+    #[test]
+    fn job_fail_reason_has_stable_names() {
+        assert_eq!(JobFailReason::GuestNotReady.to_string(), "guest_not_ready");
+        assert_eq!(
+            JobFailReason::HostOutOfMemory.to_string(),
+            "host_out_of_memory"
+        );
+        assert_eq!(JobFailReason::Other.to_string(), "other");
+        assert_eq!(JobFailReason::default(), JobFailReason::Other);
     }
 
     #[test]

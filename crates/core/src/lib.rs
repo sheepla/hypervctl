@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 pub mod actor;
+pub mod availability;
 pub mod checkpoint;
 pub mod error;
 pub mod events;
@@ -21,8 +22,9 @@ pub mod vhd;
 pub mod vm;
 
 pub use actor::{stopped_error, BackendActor};
+pub use availability::{availability, states_where_ok, Availability, OpKind};
 pub use checkpoint::{Checkpoint, CheckpointKind};
-pub use error::{HyperVError, RawError, UnavailableReason};
+pub use error::{HyperVError, JobFailReason, RawError, UnavailableReason};
 pub use events::{ChangeEvent, ChangeWatcher, DEBOUNCE, RECONNECT_DELAY};
 pub use handle::BackendHandle;
 pub use hyper_v::{HyperV, RequestedState};

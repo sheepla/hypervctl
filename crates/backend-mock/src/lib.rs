@@ -50,6 +50,12 @@ pub(crate) struct CheckpointEntry {
 /// Default time a transition stays in its intermediate state (automatic mode).
 const DEFAULT_TRANSITION_DELAY: Duration = Duration::from_millis(200);
 
+/// A pending guest reboot: the uptime resets when it is due.
+#[derive(Debug)]
+struct PendingReboot {
+    due: Instant,
+}
+
 /// In-memory backend.
 #[derive(Debug)]
 pub struct MockBackend {
@@ -59,6 +65,7 @@ pub struct MockBackend {
     vhds: Vec<VhdInfo>,
     attachments: Vec<VhdAttachment>,
     transitions: HashMap<VmId, Transition>,
+    reboots: HashMap<VmId, PendingReboot>,
     jobs: HashMap<JobRef, VmId>,
     next_job: u64,
     next_checkpoint: u64,
@@ -87,6 +94,7 @@ impl MockBackend {
             vhds: Vec::new(),
             attachments: Vec::new(),
             transitions: HashMap::new(),
+            reboots: HashMap::new(),
             jobs: HashMap::new(),
             next_job: 0,
             next_checkpoint: 0,
@@ -111,6 +119,10 @@ impl MockBackend {
         let pending: Vec<VmId> = self.transitions.keys().copied().collect();
         for id in pending {
             self.settle(id);
+        }
+        let reboots: Vec<VmId> = self.reboots.keys().copied().collect();
+        for id in reboots {
+            self.settle_reboot(id);
         }
     }
 
@@ -162,12 +174,31 @@ impl MockBackend {
         for id in due {
             self.settle(id);
         }
+        let due_reboots: Vec<VmId> = self
+            .reboots
+            .iter()
+            .filter(|(_, reboot)| reboot.due <= now)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in due_reboots {
+            self.settle_reboot(id);
+        }
     }
 
     fn settle(&mut self, id: VmId) {
         if let Some(transition) = self.transitions.remove(&id) {
             if let Ok(vm) = self.vm_mut(id) {
                 vm.summary.state = transition.target;
+            }
+            self.announce(ChangeEvent::Vms);
+        }
+    }
+
+    /// A guest reboot resets the uptime; the VM stays Running throughout.
+    fn settle_reboot(&mut self, id: VmId) {
+        if self.reboots.remove(&id).is_some() {
+            if let Ok(vm) = self.vm_mut(id) {
+                vm.summary.uptime = Some(Duration::ZERO);
             }
             self.announce(ChangeEvent::Vms);
         }
@@ -302,10 +333,10 @@ impl HyperV for MockBackend {
             RequestedState::Start => (VmState::Starting, VmState::Running),
             RequestedState::ShutDown => (VmState::Stopping, VmState::Off),
             RequestedState::TurnOff => (VmState::Stopping, VmState::Off),
-            RequestedState::Reset => (VmState::Resetting, VmState::Running),
-            RequestedState::Save => (VmState::Saving, VmState::Saved),
-            RequestedState::Pause => (VmState::Pausing, VmState::Paused),
-            RequestedState::Resume => (VmState::Resuming, VmState::Running),
+            RequestedState::Reset => (VmState::Busy, VmState::Running),
+            RequestedState::Save => (VmState::Busy, VmState::Saved),
+            RequestedState::Pause => (VmState::Busy, VmState::Paused),
+            RequestedState::Resume => (VmState::Busy, VmState::Running),
         };
         self.vm_mut(id)?.summary.state = intermediate;
         self.transitions.insert(
@@ -323,13 +354,29 @@ impl HyperV for MockBackend {
         Ok(Pending::Job(self.new_job(id)))
     }
 
-    fn create_checkpoint(&mut self, vm: VmId, name: Option<&str>) -> Result<Pending, HyperVError> {
+    fn request_guest_reboot(&mut self, id: VmId) -> Result<Pending, HyperVError> {
+        self.begin()?;
+        let vm = self.vm_mut(id)?;
+        let uptime_before = vm.summary.uptime;
+        // The VM stays Running; the uptime resets after the transition delay.
+        self.reboots.insert(
+            id,
+            PendingReboot {
+                due: Instant::now() + self.transition_delay,
+            },
+        );
+        self.announce(ChangeEvent::Vms);
+        Ok(Pending::AwaitReboot {
+            vm: id,
+            uptime_before,
+        })
+    }
+
+    fn create_checkpoint(&mut self, vm: VmId) -> Result<Pending, HyperVError> {
         self.begin()?;
         self.vm_mut(vm)?;
         let id = self.next_checkpoint_id();
-        let name = name
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("Checkpoint {}", self.next_checkpoint));
+        let name = format!("Checkpoint {}", self.next_checkpoint);
         let parent = self
             .checkpoints
             .iter()
@@ -350,6 +397,27 @@ impl HyperV for MockBackend {
         }
         self.announce(ChangeEvent::Checkpoints(vm));
         Ok(Pending::Job(self.new_job(vm)))
+    }
+
+    fn rename_checkpoint(
+        &mut self,
+        checkpoint: CheckpointId,
+        name: &str,
+    ) -> Result<Pending, HyperVError> {
+        self.begin()?;
+        let entry = self
+            .checkpoints
+            .iter_mut()
+            .find(|entry| entry.data.id == checkpoint)
+            .ok_or_else(|| HyperVError::NotFound {
+                kind: TargetKind::Checkpoint,
+                specified: checkpoint.to_string(),
+                raw: None,
+            })?;
+        entry.data.name = name.to_string();
+        let vm = entry.vm;
+        self.announce(ChangeEvent::Checkpoints(vm));
+        Ok(Pending::Done)
     }
 
     fn restore_checkpoint(
@@ -575,7 +643,7 @@ mod tests {
         let child_parent = listed.get(1).and_then(|checkpoint| checkpoint.parent_id);
         assert_eq!(child_parent, root_id);
 
-        let job = job_of(ok(backend.create_checkpoint(vm_id(2), Some("manual"))));
+        let job = job_of(ok(backend.create_checkpoint(vm_id(2))));
         assert_eq!(ok(backend.job_status(job)), JobStatus::Succeeded);
         let created = ok(backend.list_checkpoints(vm_id(2)));
         assert_eq!(created.len(), 1);
@@ -583,12 +651,15 @@ mod tests {
             created.first().map(|checkpoint| checkpoint.id),
             "the new checkpoint",
         );
+        // Rename after creation (design 3.3).
+        ok(backend.rename_checkpoint(created_id, "manual"));
+        let renamed = ok(backend.list_checkpoints(vm_id(2)));
         assert_eq!(
-            created.first().map(|checkpoint| checkpoint.name.as_str()),
+            renamed.first().map(|checkpoint| checkpoint.name.as_str()),
             Some("manual")
         );
         assert_eq!(
-            created.first().and_then(|checkpoint| checkpoint.parent_id),
+            renamed.first().and_then(|checkpoint| checkpoint.parent_id),
             None
         );
         assert_eq!(ok(backend.get_vm(vm_id(2))).checkpoint_count, 1);
@@ -596,6 +667,25 @@ mod tests {
         ok(backend.remove_checkpoint(created_id));
         assert!(ok(backend.list_checkpoints(vm_id(2))).is_empty());
         assert_eq!(ok(backend.get_vm(vm_id(2))).checkpoint_count, 0);
+    }
+
+    #[test]
+    fn guest_reboot_reports_pending_await_reboot_with_the_uptime() {
+        let mut backend = MockBackend::with_fixture();
+        backend.set_transition_delay(Duration::ZERO);
+        let running = vm_id(1);
+        let pending = ok(backend.request_guest_reboot(running));
+        match pending {
+            Pending::AwaitReboot { vm, uptime_before } => {
+                assert_eq!(vm, running);
+                assert_eq!(uptime_before, Some(Duration::from_secs(3600)));
+            }
+            other => panic!("expected AwaitReboot, got {other:?}"),
+        }
+        // The reboot settles on the next call, resetting the uptime.
+        assert_eq!(state_of(&mut backend, "web-01"), VmState::Running);
+        let vm = ok(backend.get_vm(running));
+        assert_eq!(vm.summary.uptime, Some(Duration::ZERO));
     }
 
     #[test]
