@@ -10,6 +10,7 @@ use crate::hyper_v::RequestedState;
 use crate::ids::{SwitchId, VmId};
 use crate::job::{JobRef, JobStatus, Pending};
 use crate::switch::{SwitchDetail, SwitchSummary};
+use crate::thumbnail::Thumbnail;
 use crate::vhd::{AttachedVhd, VhdInfo};
 use crate::vm::{VmDetail, VmSummary};
 
@@ -72,6 +73,21 @@ impl BackendHandle {
     pub async fn get_vhd(&self, path: &str) -> Result<VhdInfo, HyperVError> {
         let path = path.to_string();
         self.call(|tx| Command::GetVhd { path, tx }).await
+    }
+
+    pub async fn get_thumbnail(
+        &self,
+        id: VmId,
+        width: u16,
+        height: u16,
+    ) -> Result<Thumbnail, HyperVError> {
+        self.call(|tx| Command::GetThumbnail {
+            id,
+            width,
+            height,
+            tx,
+        })
+        .await
     }
 
     pub async fn request_vm_state(

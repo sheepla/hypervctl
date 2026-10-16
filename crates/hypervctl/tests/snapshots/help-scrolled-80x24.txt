@@ -6,6 +6,7 @@
 ┃ │1 details tab                                                             │ ┃
 ┗━│2 checkpoints tab                                                         │━┛
 ┌d│3 monitor tab                                                             │─┐
+│ │4 thumbnail tab                                                           │ │
 │ │j/Down move                                                               │ │
 │ │k/Up move                                                                 │ │
 │ │g first                                                                   │ │
@@ -18,7 +19,6 @@
 │ │                                                                          │ │
 │ │j/Down move                                                               │ │
 │ │k/Up move                                                                 │ │
-│ │Enter run                                                                 │ │
 │ └──────────────────────────────────────────────────────────────────────────┘ │
 └──────────────────────────────────────────────────────────── lines 1-12 of 13 ┘
 j/Down scroll  k/Up scroll  g top  G bottom  ? close  Esc close  q/Ctrl+C quit

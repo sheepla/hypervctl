@@ -18,6 +18,7 @@ pub mod job;
 pub mod ops;
 pub mod switch;
 pub mod target;
+pub mod thumbnail;
 pub mod vhd;
 pub mod vm;
 
@@ -33,6 +34,7 @@ pub use job::{JobRef, JobStatus, Pending};
 pub use ops::{OpId, OpOutcome, OpSuccess, Operations, Phase, Progress, VmOp, WaitPolicy};
 pub use switch::{SwitchDetail, SwitchKind, SwitchSummary, VlanMode, VlanSettings};
 pub use target::{Candidate, Target, TargetKind};
+pub use thumbnail::Thumbnail;
 pub use vhd::{
     AttachedVhd, Controller, ControllerKind, VhdAttachment, VhdFormat, VhdInfo, VhdKind,
 };

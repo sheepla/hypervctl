@@ -16,6 +16,7 @@ use crate::hyper_v::{HyperV, RequestedState};
 use crate::ids::{SwitchId, VmId};
 use crate::job::{JobRef, JobStatus, Pending};
 use crate::switch::{SwitchDetail, SwitchSummary};
+use crate::thumbnail::Thumbnail;
 use crate::vhd::{AttachedVhd, VhdInfo};
 use crate::vm::{VmDetail, VmSummary};
 
@@ -47,6 +48,12 @@ pub(crate) enum Command {
     GetVhd {
         path: String,
         tx: Reply<VhdInfo>,
+    },
+    GetThumbnail {
+        id: VmId,
+        width: u16,
+        height: u16,
+        tx: Reply<Thumbnail>,
     },
     RequestVmState {
         id: VmId,
@@ -107,6 +114,14 @@ impl Command {
             }
             Command::GetVhd { path, tx } => {
                 let _ = tx.send(backend.get_vhd(&path));
+            }
+            Command::GetThumbnail {
+                id,
+                width,
+                height,
+                tx,
+            } => {
+                let _ = tx.send(backend.get_thumbnail(id, width, height));
             }
             Command::RequestVmState { id, request, tx } => {
                 let _ = tx.send(backend.request_vm_state(id, request));

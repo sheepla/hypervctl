@@ -3,18 +3,29 @@
 
 use std::time::Instant;
 
-use hypervctl_core::{BackendHandle, OpSuccess, Operations, WaitPolicy};
+use hypervctl_core::{
+    BackendHandle, HyperVError, OpSuccess, Operations, RawError, Thumbnail, WaitPolicy,
+};
+use ratatui_image::picker::Picker;
+use ratatui_image::Resize;
 use tokio::sync::mpsc;
 
 use crate::cli::commands::vm::past_tense;
 use crate::cli::output::operations::settled_word;
+use crate::tui::store::thumbnail::{self, ThumbnailImage};
 use crate::tui::store::{Action, Effect, OpFailure, OpRequest};
 
 /// Spawns `effect` on the runtime; its answer comes back through `actions`.
+///
+/// `handle` serves the ordinary commands, `thumbnails` the dedicated thumbnail
+/// actor so a slow fetch never blocks one (spec 3.10, design 5.13); `picker`
+/// is the terminal's image protocol, `None` when it cannot show images.
 pub fn spawn(
     effect: Effect,
     ops: &Operations,
     handle: &BackendHandle,
+    thumbnails: &BackendHandle,
+    picker: Option<&Picker>,
     actions: &mpsc::UnboundedSender<Action>,
 ) {
     match effect {
@@ -53,6 +64,23 @@ pub fn spawn(
                 });
             });
         }
+        Effect::FetchThumbnail { vm, cells } => {
+            let handle = thumbnails.clone();
+            let actions = actions.clone();
+            let picker = picker.cloned();
+            tokio::spawn(async move {
+                let result = match picker {
+                    Some(picker) => fetch_thumbnail(&handle, &picker, vm, cells).await,
+                    None => Err(HyperVError::backend(RawError::new(
+                        "the terminal cannot show images",
+                    ))),
+                };
+                let _ = actions.send(Action::ThumbnailLoaded {
+                    for_vm: vm,
+                    result: Box::new(result),
+                });
+            });
+        }
         Effect::RunOperation(request) => {
             let ops = ops.clone();
             let actions = actions.clone();
@@ -83,6 +111,45 @@ pub fn spawn(
         // The loop breaks on this one; nothing to run.
         Effect::Quit => {}
     }
+}
+
+/// Fetches one thumbnail and hands back something drawable (design 5.13).
+/// Decoding and resizing happen here, off the main loop.
+async fn fetch_thumbnail(
+    handle: &BackendHandle,
+    picker: &Picker,
+    vm: hypervctl_core::VmId,
+    cells: (u16, u16),
+) -> Result<ThumbnailImage, HyperVError> {
+    let (width, height) = thumbnail::requested_pixels(cells, picker.font_size());
+    let thumbnail = handle.get_thumbnail(vm, width, height).await?;
+    build_thumbnail(picker, thumbnail, cells)
+}
+
+/// Turns the raw RGBA of a thumbnail into a protocol the terminal can draw
+/// (design 5.13).
+fn build_thumbnail(
+    picker: &Picker,
+    thumbnail: Thumbnail,
+    cells: (u16, u16),
+) -> Result<ThumbnailImage, HyperVError> {
+    let buffer = image::RgbaImage::from_raw(thumbnail.width, thumbnail.height, thumbnail.rgba)
+        .ok_or_else(|| {
+            HyperVError::backend(RawError::new("the thumbnail had a broken pixel buffer"))
+        })?;
+    let size = ratatui::layout::Size::new(cells.0, cells.1);
+    picker
+        .new_protocol(
+            image::DynamicImage::ImageRgba8(buffer),
+            size,
+            Resize::Fit(None),
+        )
+        .map(ThumbnailImage::new)
+        .map_err(|error| {
+            HyperVError::backend(RawError::new(format!(
+                "could not prepare the thumbnail: {error}"
+            )))
+        })
 }
 
 /// One operation of the menu, waiting for its goal (spec 3.5). The message is

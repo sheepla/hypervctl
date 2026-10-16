@@ -3,12 +3,14 @@
 
 use hypervctl_core::{Checkpoint, CheckpointId, VmDetail, VmId};
 
-/// The tabs of the detail pane (spec 3.2; `Monitor` since M12).
+/// The tabs of the detail pane (spec 3.2; `Monitor` since M12, `Thumbnail`
+/// since M13).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DetailTab {
     Details,
     Checkpoints,
     Monitor,
+    Thumbnail,
 }
 
 impl DetailTab {
@@ -17,16 +19,18 @@ impl DetailTab {
         match self {
             Self::Details => Self::Checkpoints,
             Self::Checkpoints => Self::Monitor,
-            Self::Monitor => Self::Details,
+            Self::Monitor => Self::Thumbnail,
+            Self::Thumbnail => Self::Details,
         }
     }
 
     /// The tab to the left, wrapping around.
     pub const fn previous(self) -> Self {
         match self {
-            Self::Details => Self::Monitor,
+            Self::Details => Self::Thumbnail,
             Self::Checkpoints => Self::Details,
             Self::Monitor => Self::Checkpoints,
+            Self::Thumbnail => Self::Monitor,
         }
     }
 }
@@ -167,12 +171,14 @@ mod tests {
     use super::DetailTab;
 
     #[test]
-    fn the_three_tabs_cycle_in_the_order_of_the_pane() {
+    fn the_four_tabs_cycle_in_the_order_of_the_pane() {
         use DetailTab::*;
         assert_eq!(Details.next(), Checkpoints);
         assert_eq!(Checkpoints.next(), Monitor);
-        assert_eq!(Monitor.next(), Details);
-        assert_eq!(Details.previous(), Monitor);
+        assert_eq!(Monitor.next(), Thumbnail);
+        assert_eq!(Thumbnail.next(), Details);
+        assert_eq!(Details.previous(), Thumbnail);
+        assert_eq!(Thumbnail.previous(), Monitor);
         assert_eq!(Monitor.previous(), Checkpoints);
         assert_eq!(Checkpoints.previous(), Details);
     }

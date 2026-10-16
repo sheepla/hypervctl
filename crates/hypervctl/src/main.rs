@@ -12,7 +12,7 @@ use tracing_subscriber::filter::LevelFilter;
 use hypervctl_backend_mock::MockBackend;
 #[cfg(windows)]
 use hypervctl_backend_wmi::WmiBackend;
-use hypervctl_core::{BackendActor, HyperVError, Operations, RawError};
+use hypervctl_core::{BackendActor, BackendHandle, HyperVError, Operations, RawError};
 
 use crate::cli::args::Cli;
 use crate::cli::commands::Context;
@@ -102,6 +102,19 @@ fn ensure_backend() -> Result<BackendChoice, CliError> {
         other => Err(CliError::Backend(HyperVError::backend(RawError::new(
             format!("unknown HYPERVCTL_BACKEND value: {other}"),
         )))),
+    }
+}
+
+/// The dedicated backend for the Thumbnail tab (spec 3.10, design 5.13): a
+/// second actor on its own connection, so a slow image fetch never queues
+/// behind an ordinary command. The same rule as `ensure_backend` picks it.
+pub(crate) fn spawn_thumbnail_backend() -> BackendHandle {
+    match ensure_backend() {
+        Ok(BackendChoice::Mock) => BackendActor::spawn(MockBackend::with_fixture),
+        #[cfg(windows)]
+        Ok(BackendChoice::Wmi) => BackendActor::spawn(WmiBackend::connect_or_unavailable),
+        // Unknown values were rejected before the TUI ever started.
+        Err(_) => BackendActor::spawn(MockBackend::with_fixture),
     }
 }
 

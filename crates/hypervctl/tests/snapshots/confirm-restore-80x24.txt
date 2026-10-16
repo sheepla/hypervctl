@@ -6,7 +6,7 @@
 │ > web-02                          Off              -          -            - │
 └──────────────────────────────────────────────────────────────────────────────┘
 ┏web-02 · Off━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-┃ Details   Checkpoints   Monitor                                              ┃
+┃ Details   Checkpoints   Monitor   Thumbnail                                  ┃
 ┃                                                                              ┃
 ┃ NAME                                     TYPE         CREATED                ┃
 ┃ > ckpt-1                                   standard     -                    ┃

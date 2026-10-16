@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use hypervctl_core::{
     AttachedVhd, BackendActor, ChangeEvent, Checkpoint, CheckpointId, HyperV, HyperVError, JobRef,
-    JobStatus, Pending, RawError, RequestedState, SwitchDetail, SwitchId, SwitchSummary, VhdInfo,
-    VmDetail, VmId, VmState, VmSummary,
+    JobStatus, Pending, RawError, RequestedState, SwitchDetail, SwitchId, SwitchSummary, Thumbnail,
+    VhdInfo, VmDetail, VmId, VmState, VmSummary,
 };
 
 fn no_notifications() -> Result<tokio::sync::mpsc::UnboundedReceiver<ChangeEvent>, HyperVError> {
@@ -32,6 +32,15 @@ impl HyperV for NotSendBackend {
     fn list_vms(&mut self) -> Result<Vec<VmSummary>, HyperVError> {
         let _ = self.factory_thread.send(thread::current().id());
         Ok(self.vms.clone())
+    }
+
+    fn get_thumbnail(
+        &mut self,
+        _id: VmId,
+        _width: u16,
+        _height: u16,
+    ) -> Result<Thumbnail, HyperVError> {
+        Err(unused())
     }
 
     fn get_vm(&mut self, _id: VmId) -> Result<VmDetail, HyperVError> {
@@ -117,6 +126,15 @@ impl HyperV for PanickingBackend {
             panic!("simulated backend panic");
         }
         Ok(Vec::new())
+    }
+
+    fn get_thumbnail(
+        &mut self,
+        _id: VmId,
+        _width: u16,
+        _height: u16,
+    ) -> Result<Thumbnail, HyperVError> {
+        Err(unused())
     }
 
     fn get_vm(&mut self, _id: VmId) -> Result<VmDetail, HyperVError> {

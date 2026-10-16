@@ -10,7 +10,8 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
-use hypervctl_core::{Checkpoint, CheckpointKind};
+use hypervctl_core::{Checkpoint, CheckpointKind, VmState};
+use ratatui_image::Image;
 
 use crate::cli::output::format;
 use crate::cli::output::table::width;
@@ -46,6 +47,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &State) {
             render_checkpoints(frame, list_area, state);
         }
         DetailTab::Monitor => render_monitor(frame, body_area, state),
+        DetailTab::Thumbnail => render_thumbnail(frame, body_area, state),
         DetailTab::Details => {
             // The scroll offset comes from the reducer; the view only slices.
             let lines = body_lines(state);
@@ -84,6 +86,15 @@ fn tab_line(state: &State) -> Line<'static> {
         Span::styled(
             "Monitor",
             if state.detail.tab == DetailTab::Monitor {
+                selected
+            } else {
+                plain
+            },
+        ),
+        Span::raw("   "),
+        Span::styled(
+            "Thumbnail",
+            if state.detail.tab == DetailTab::Thumbnail {
                 selected
             } else {
                 plain
@@ -130,8 +141,8 @@ fn lines_label(state: &State) -> Option<String> {
             Some(format!(" rows {}-{} of {total} ", offset + 1, last))
         }
         // The graphs never scroll, so there is no range to report (design
-        // 5.12).
-        DetailTab::Monitor => None,
+        // 5.12). Nor does the thumbnail (design 5.13).
+        DetailTab::Monitor | DetailTab::Thumbnail => None,
     }
 }
 
@@ -464,6 +475,51 @@ fn render_monitor(frame: &mut Frame, area: Rect, state: &State) {
             window,
         },
     );
+}
+
+/// The Thumbnail tab (spec 3.10): the console image of the selected VM, or the
+/// reason there is none. The effect already decoded and sized the image; the
+/// view only draws it (design 5.13).
+fn render_thumbnail(frame: &mut Frame, area: Rect, state: &State) {
+    if !state.ui.image_supported {
+        frame.render_widget(
+            Paragraph::new(Line::raw("Thumbnails are not supported by this terminal")),
+            area,
+        );
+        return;
+    }
+    let Some(summary) = state.vm_list.selected_summary() else {
+        let message = if state.vm_list.items.is_empty() {
+            "No VMs"
+        } else {
+            "No matching VMs"
+        };
+        frame.render_widget(Paragraph::new(Line::raw(message)), area);
+        return;
+    };
+    if summary.state != VmState::Running {
+        frame.render_widget(
+            Paragraph::new(Line::raw(format!(
+                "No preview (VM is {})",
+                state_label(summary.state)
+            ))),
+            area,
+        );
+        return;
+    }
+    // The image belongs to the VM on screen and to this pane size; anything
+    // else is stale and waits for its replacement (spec 3.10).
+    let current = state.thumbnail.for_vm == state.vm_list.selected
+        && state.thumbnail.cells == Some(layout::thumbnail_cells(state.ui.layout));
+    match state.thumbnail.protocol.as_ref().filter(|_| current) {
+        Some(image) => {
+            let widget = Image::new(image.protocol()).allow_clipping(true);
+            frame.render_widget(widget, area);
+        }
+        // Nothing yet, or a failed fetch: the pane says so until the next try
+        // (spec 3.10).
+        None => frame.render_widget(Paragraph::new(Line::raw("Loading...")), area),
+    }
 }
 
 /// The axes one graph is drawn with (design 5.12).

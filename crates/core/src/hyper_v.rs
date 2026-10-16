@@ -12,6 +12,7 @@ use crate::error::HyperVError;
 use crate::events::ChangeEvent;
 use crate::ids::{SwitchId, VmId};
 use crate::switch::{SwitchDetail, SwitchSummary};
+use crate::thumbnail::Thumbnail;
 use crate::vhd::{AttachedVhd, VhdInfo};
 use crate::vm::{VmDetail, VmSummary};
 
@@ -78,6 +79,16 @@ pub trait HyperV {
 
     /// Disk information for a path, whether or not it is attached.
     fn get_vhd(&mut self, path: &str) -> Result<VhdInfo, HyperVError>;
+
+    /// A snapshot of the VM's console at `width` x `height` pixels (design
+    /// 5.13). Only a VM with a console (`Running`, `Paused`, `Saved`) answers;
+    /// the others fail the way Hyper-V does.
+    fn get_thumbnail(
+        &mut self,
+        id: VmId,
+        width: u16,
+        height: u16,
+    ) -> Result<Thumbnail, HyperVError>;
 
     fn request_vm_state(
         &mut self,
@@ -168,6 +179,15 @@ mod tests {
         }
 
         fn get_vhd(&mut self, _path: &str) -> Result<VhdInfo, HyperVError> {
+            Err(HyperVError::backend(crate::error::RawError::new("stub")))
+        }
+
+        fn get_thumbnail(
+            &mut self,
+            _id: VmId,
+            _width: u16,
+            _height: u16,
+        ) -> Result<Thumbnail, HyperVError> {
             Err(HyperVError::backend(crate::error::RawError::new("stub")))
         }
 

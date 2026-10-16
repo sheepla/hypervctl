@@ -13,6 +13,7 @@ pub mod menu;
 pub mod ops_state;
 pub mod overlay;
 pub mod status;
+pub mod thumbnail;
 pub mod vm_list;
 
 use detail::DetailState;
@@ -25,6 +26,7 @@ use menu::{
 use ops_state::OpsState;
 pub use overlay::{ConfirmState, MenuKind, MenuState, OpRequest, Overlay};
 use status::{StatusKind, StatusState};
+pub use thumbnail::{ThumbnailImage, ThumbnailState};
 use vm_list::VmListState;
 
 use crate::tui::features;
@@ -61,6 +63,10 @@ pub struct UiState {
     /// How far back the Monitor graphs look (design 5.12): the CLI's
     /// `--refresh`, defaulting to the CLI default of 2 s.
     pub refresh: Duration,
+    /// Whether the terminal can show images at all (spec 3.10): detection ran
+    /// once at startup; `false` means the Thumbnail tab only shows its
+    /// placeholder.
+    pub image_supported: bool,
 }
 
 impl UiState {
@@ -94,6 +100,8 @@ pub struct State {
     /// The samples of every VM, recorded on every list update whatever tab is
     /// up (spec 3.9, design 5.12).
     pub history: History,
+    /// The console thumbnail of the VM on screen (spec 3.10, design 5.13).
+    pub thumbnail: ThumbnailState,
     /// How far the help overlay is scrolled (design 5.11).
     pub help_scroll: u16,
     /// The backend actor stopped: the loop ends and the exit code is 1
@@ -136,8 +144,10 @@ impl State {
                 mock: false,
                 now: Instant::now(),
                 refresh: Duration::from_secs(2),
+                image_supported: false,
             },
             history: History::default(),
+            thumbnail: ThumbnailState::default(),
             help_scroll: 0,
             fatal: None,
         }
@@ -167,7 +177,11 @@ impl State {
     /// operation spins or the `stale 12s` age ticks (design 5.2, spec 3.2
     /// and 3.5).
     pub fn needs_ui_tick(&self) -> bool {
-        self.status.needs_tick() || !self.ops.is_empty() || self.vm_list.stale_since.is_some()
+        self.status.needs_tick()
+            || !self.ops.is_empty()
+            || self.vm_list.stale_since.is_some()
+            // The Thumbnail tab refreshes on the UI clock (spec 3.10).
+            || (self.detail.tab == DetailTab::Thumbnail && self.ui.image_supported)
     }
 }
 
@@ -177,6 +191,12 @@ pub enum Effect {
     FetchVmList,
     FetchVmDetail(VmId),
     FetchCheckpoints(VmId),
+    /// Reads the console thumbnail of `vm` at the pane's `cells` size (spec
+    /// 3.10, design 5.13). Runs on its own actor so it never blocks a command.
+    FetchThumbnail {
+        vm: VmId,
+        cells: (u16, u16),
+    },
     RunOperation(OpRequest),
     Quit,
 }
@@ -238,6 +258,12 @@ pub enum Action {
     CheckpointsLoaded {
         vm: VmId,
         result: Box<Result<Vec<Checkpoint>, HyperVError>>,
+    },
+    /// The thumbnail fetch answered; it carries the VM it was asked for, so a
+    /// late answer for another VM is dropped (spec 3.10).
+    ThumbnailLoaded {
+        for_vm: VmId,
+        result: Box<Result<ThumbnailImage, HyperVError>>,
     },
     OpFinished {
         vm: VmId,
@@ -463,6 +489,22 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
                 Err(error) => state.status.show(StatusKind::Error, error.to_string()),
             }
         }
+        Action::ThumbnailLoaded { for_vm, result } => {
+            // A late answer for a VM that is no longer the one on the tab is
+            // dropped whole; touching `in_flight` would eat the next request
+            // (spec 3.10, design 5.5).
+            if state.thumbnail.for_vm != Some(for_vm) {
+                return effects;
+            }
+            state.thumbnail.in_flight = false;
+            match *result {
+                Ok(image) => state.thumbnail.protocol = Some(image),
+                Err(error) if error.is_backend_stopped() => state.fatal = Some(error),
+                // A failure (an Off VM, a refused size) is not fatal: the pane
+                // keeps its placeholder until the next try (spec 3.10).
+                Err(_) => state.thumbnail.protocol = None,
+            }
+        }
         Action::OpFinished { vm, result, at } => {
             state.ops.finish(vm);
             match result {
@@ -486,8 +528,52 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
     // the same arithmetic the view uses: the selection stays visible, the
     // detail and help scrolls stay inside their content (spec 3.3, design
     // 5.11).
+    schedule_thumbnail(state, &mut effects);
     sync_scrolls(state);
     effects
+}
+
+/// Asks for the console thumbnail of the selected VM when the Thumbnail tab is
+/// up and a preview is due (spec 3.10, design 5.13): only a Running VM has a
+/// console to show, only one fetch runs at a time, and a VM or pane-size
+/// change refreshes at once while the same view waits out
+/// [`thumbnail::THUMBNAIL_INTERVAL`].
+fn schedule_thumbnail(state: &mut State, effects: &mut Vec<Effect>) {
+    if !state.ui.image_supported || state.detail.tab != DetailTab::Thumbnail {
+        return;
+    }
+    let Some(vm) = state.vm_list.selected else {
+        return;
+    };
+    let previewable = state
+        .vm_list
+        .selected_summary()
+        .is_some_and(|summary| summary.state == VmState::Running);
+    if !previewable || state.thumbnail.in_flight {
+        return;
+    }
+    let cells = layout::thumbnail_cells(state.ui.layout);
+    if cells.0 == 0 || cells.1 == 0 {
+        return;
+    }
+    let unchanged = state.thumbnail.for_vm == Some(vm) && state.thumbnail.cells == Some(cells);
+    if unchanged {
+        if let Some(last) = state.thumbnail.last_request {
+            if state.ui.now.saturating_duration_since(last) < thumbnail::THUMBNAIL_INTERVAL {
+                return;
+            }
+        }
+    }
+    state.thumbnail.for_vm = Some(vm);
+    state.thumbnail.cells = Some(cells);
+    // A new VM or a new pane size makes the current image stale at once, so
+    // the pane shows its placeholder instead of the previous preview.
+    if !unchanged {
+        state.thumbnail.protocol = None;
+    }
+    state.thumbnail.in_flight = true;
+    state.thumbnail.last_request = Some(state.ui.now);
+    effects.push(Effect::FetchThumbnail { vm, cells });
 }
 
 /// The pane rectangles for the rows that are actually shown: the visible
@@ -519,8 +605,8 @@ fn scroll_by(state: &mut State, delta: isize) {
         }
         return;
     }
-    // The Monitor graphs do not scroll (design 5.12).
-    if state.detail.tab == DetailTab::Monitor {
+    // The Monitor graphs and the Thumbnail do not scroll (design 5.12, 5.13).
+    if matches!(state.detail.tab, DetailTab::Monitor | DetailTab::Thumbnail) {
         return;
     }
     if state.focus == Focus::Detail && state.detail.tab == DetailTab::Checkpoints {
@@ -541,8 +627,8 @@ fn scroll_to_edge(state: &mut State, bottom: bool) {
         state.help_scroll = if bottom { u16::MAX } else { 0 };
         return;
     }
-    // The Monitor graphs do not scroll (design 5.12).
-    if state.detail.tab == DetailTab::Monitor {
+    // The Monitor graphs and the Thumbnail do not scroll (design 5.12, 5.13).
+    if matches!(state.detail.tab, DetailTab::Monitor | DetailTab::Thumbnail) {
         return;
     }
     if state.focus == Focus::Detail && state.detail.tab == DetailTab::Checkpoints {
@@ -942,7 +1028,7 @@ mod tests {
     use std::time::Duration;
 
     use crossterm::event::{KeyCode, KeyModifiers};
-    use hypervctl_core::{Checkpoint, CheckpointId, CheckpointKind, MemoryConfig};
+    use hypervctl_core::{Checkpoint, CheckpointId, CheckpointKind, MemoryConfig, RawError};
     use uuid::Uuid;
 
     use super::*;
@@ -1591,5 +1677,82 @@ mod tests {
             state.history.ring(web01).map(|ring| ring.iter().count()),
             Some(2)
         );
+    }
+
+    #[test]
+    fn the_thumbnail_is_fetched_only_while_its_tab_is_up() {
+        // Anomaly 32: another tab never asks for a thumbnail.
+        let mut state = sample_state();
+        state.ui.image_supported = true;
+        let details = reduce(&mut state, Action::RefreshTick);
+        assert!(
+            !details
+                .iter()
+                .any(|effect| matches!(effect, Effect::FetchThumbnail { .. })),
+            "{details:?}"
+        );
+        let open = reduce(&mut state, Action::SelectTab(DetailTab::Thumbnail));
+        assert!(
+            open.iter()
+                .any(|effect| matches!(effect, Effect::FetchThumbnail { .. })),
+            "{open:?}"
+        );
+        assert!(state.thumbnail.in_flight);
+    }
+
+    #[test]
+    fn the_thumbnail_waits_out_the_interval_before_asking_again() {
+        // Anomaly 32: a running fetch and a fresh one are not piled up.
+        let mut state = sample_state();
+        state.ui.image_supported = true;
+        let web01 = VmId::new(Uuid::from_u128(1 << 96));
+        let _ = reduce(&mut state, Action::SelectTab(DetailTab::Thumbnail));
+        // A failed answer clears the in-flight flag without a protocol.
+        let _ = reduce(
+            &mut state,
+            Action::ThumbnailLoaded {
+                for_vm: web01,
+                result: Box::new(Err(HyperVError::backend(RawError::new("no console")))),
+            },
+        );
+        assert!(!state.thumbnail.in_flight);
+        let now = state.ui.now;
+        let soon = reduce(&mut state, Action::UiTick(now + Duration::from_secs(1)));
+        assert!(
+            !soon
+                .iter()
+                .any(|effect| matches!(effect, Effect::FetchThumbnail { .. })),
+            "a second later is too soon: {soon:?}"
+        );
+        let now = state.ui.now;
+        let later = reduce(&mut state, Action::UiTick(now + Duration::from_secs(6)));
+        assert!(
+            later
+                .iter()
+                .any(|effect| matches!(effect, Effect::FetchThumbnail { .. })),
+            "six seconds later a new fetch is due: {later:?}"
+        );
+    }
+
+    #[test]
+    fn a_late_thumbnail_for_another_vm_is_dropped() {
+        // Anomaly 32: an answer that names a VM no longer on the tab is
+        // dropped whole, leaving the in-flight fetch for the current VM.
+        let mut state = sample_state();
+        state.ui.image_supported = true;
+        let web01 = VmId::new(Uuid::from_u128(1 << 96));
+        let web02 = VmId::new(Uuid::from_u128(2 << 96));
+        let _ = reduce(&mut state, Action::SelectTab(DetailTab::Thumbnail));
+        assert!(state.thumbnail.in_flight);
+        let _ = reduce(
+            &mut state,
+            Action::ThumbnailLoaded {
+                for_vm: web02,
+                result: Box::new(Err(HyperVError::backend(RawError::new("stale")))),
+            },
+        );
+        assert!(state.thumbnail.in_flight, "the current fetch still runs");
+        assert_eq!(state.thumbnail.for_vm, Some(web01));
+        assert!(state.thumbnail.protocol.is_none());
     }
 }

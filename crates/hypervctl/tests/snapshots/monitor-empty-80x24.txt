@@ -6,7 +6,7 @@
 ┃   web-02                          Off              -          -            - ┃
 ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
 ┌web-01 · Running──────────────────────────────────────────────────────────────┐
-│ Details   Checkpoints   Monitor                                              │
+│ Details   Checkpoints   Monitor   Thumbnail                                  │
 │ No samples yet                                                               │
 │                                                                              │
 │                                                                              │

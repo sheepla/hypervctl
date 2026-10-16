@@ -15,7 +15,8 @@ use hypervctl_core::vhd::vhd_path_eq;
 use hypervctl_core::{
     AttachedVhd, ChangeEvent, Checkpoint, CheckpointId, CheckpointKind, HyperV, HyperVError,
     JobFailReason, JobRef, JobStatus, Pending, RawError, RequestedState, SwitchDetail, SwitchId,
-    SwitchSummary, TargetKind, VhdAttachment, VhdInfo, VmDetail, VmId, VmState, VmSummary,
+    SwitchSummary, TargetKind, Thumbnail, VhdAttachment, VhdInfo, VmDetail, VmId, VmState,
+    VmSummary,
 };
 use tokio::sync::mpsc::{self, UnboundedSender};
 // A paused test clock is honoured when the mock runs on a runtime thread;
@@ -261,6 +262,32 @@ impl MockBackend {
     }
 }
 
+/// A deterministic thumbnail for the mock: a checkerboard of two colours
+/// derived from the VM id, so a test can tell one VM's console from another's.
+fn thumbnail_pattern(id: VmId, width: u16, height: u16) -> Thumbnail {
+    const CELL: u32 = 8;
+    let seed = id.as_uuid().as_bytes()[0];
+    let first = [seed, 0x20, 0xFF - seed, 0xFF];
+    let second = [0xFF - seed, 0xC0, seed, 0xFF];
+    let (w, h) = (u32::from(width), u32::from(height));
+    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            let color = if ((x / CELL) + (y / CELL)).is_multiple_of(2) {
+                first
+            } else {
+                second
+            };
+            rgba.extend_from_slice(&color);
+        }
+    }
+    Thumbnail {
+        width: w,
+        height: h,
+        rgba,
+    }
+}
+
 impl HyperV for MockBackend {
     fn list_vms(&mut self) -> Result<Vec<VmSummary>, HyperVError> {
         self.begin()?;
@@ -345,6 +372,38 @@ impl HyperV for MockBackend {
                 specified: path.to_string(),
                 raw: None,
             })
+    }
+
+    fn get_thumbnail(
+        &mut self,
+        id: VmId,
+        width: u16,
+        height: u16,
+    ) -> Result<Thumbnail, HyperVError> {
+        self.begin()?;
+        let vm = self
+            .vms
+            .iter()
+            .find(|vm| vm.summary.id == id)
+            .ok_or_else(|| HyperVError::NotFound {
+                kind: TargetKind::Vm,
+                specified: id.to_string(),
+                raw: None,
+            })?;
+        // Only a VM with a console has a thumbnail; Hyper-V rejects the rest
+        // (M13-V, `docs/hypervctl-m13-findings.md`).
+        if !matches!(
+            vm.summary.state,
+            VmState::Running | VmState::Paused | VmState::Saved
+        ) {
+            return Err(HyperVError::InvalidState {
+                target: Some(id),
+                state: vm.summary.state,
+                operation: "get_thumbnail".to_string(),
+                raw: None,
+            });
+        }
+        Ok(thumbnail_pattern(id, width, height))
     }
 
     fn request_vm_state(
@@ -818,5 +877,22 @@ mod tests {
                 raw: None,
             })
         );
+    }
+
+    #[test]
+    fn a_thumbnail_comes_back_only_for_a_vm_with_a_console() {
+        let mut backend = MockBackend::with_fixture();
+        let running = ok(backend.get_thumbnail(vm_id(1), 16, 8));
+        assert_eq!(running.width, 16);
+        assert_eq!(running.height, 8);
+        assert_eq!(running.rgba.len(), 16 * 8 * 4);
+        // web-02 is Off: no console, no thumbnail (M13-V).
+        assert!(matches!(
+            err(backend.get_thumbnail(vm_id(2), 16, 8)),
+            HyperVError::InvalidState {
+                state: VmState::Off,
+                ..
+            }
+        ));
     }
 }

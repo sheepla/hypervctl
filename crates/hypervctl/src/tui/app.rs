@@ -7,6 +7,7 @@ use crossterm::event::{self, Event};
 use hypervctl_core::{
     BackendHandle, ChangeEvent, ChangeWatcher, HyperVError, Operations, RawError,
 };
+use ratatui_image::picker::{Picker, ProtocolType};
 use tokio::sync::mpsc;
 use tokio::time::{self, Instant, MissedTickBehavior};
 
@@ -24,6 +25,12 @@ const UI_TICK: Duration = Duration::from_millis(100);
 struct Loop {
     ops: Operations,
     handle: BackendHandle,
+    /// The dedicated actor the Thumbnail fetches run on, so they never queue
+    /// behind a command (spec 3.10, design 5.13).
+    thumbnails: BackendHandle,
+    /// The terminal's image protocol, or `None` when it can only do half
+    /// blocks (spec 3.10).
+    picker: Option<Picker>,
     actions: mpsc::UnboundedSender<Action>,
 }
 
@@ -51,6 +58,12 @@ pub async fn run(
     // the Monitor window follows the refresh interval (design 5.12).
     state.ui.mock = mock;
     state.ui.refresh = refresh;
+    // The terminal's image protocol is detected once, after the alternate
+    // screen is up but before the key reader starts, so the query sees its own
+    // answers (spec 3.10, design 5.13).
+    let picker = detect_picker();
+    state.ui.image_supported = picker.is_some();
+    let thumbnails = crate::spawn_thumbnail_backend();
 
     // Step 5: change notifications, keys and the timers.
     let (actions, mut incoming) = mpsc::unbounded_channel();
@@ -66,6 +79,8 @@ pub async fn run(
     let looping = Loop {
         ops: ops.clone(),
         handle: ops.handle().clone(),
+        thumbnails,
+        picker,
         actions,
     };
 
@@ -76,6 +91,8 @@ pub async fn run(
             Effect::FetchVmDetail(id),
             &looping.ops,
             &looping.handle,
+            &looping.thumbnails,
+            looping.picker.as_ref(),
             &looping.actions,
         );
     }
@@ -163,7 +180,14 @@ fn step(state: &mut State, action: Action, looping: &Loop) -> bool {
     for effect in store::reduce(state, action) {
         match effect {
             Effect::Quit => return false,
-            other => effects::spawn(other, &looping.ops, &looping.handle, &looping.actions),
+            other => effects::spawn(
+                other,
+                &looping.ops,
+                &looping.handle,
+                &looping.thumbnails,
+                looping.picker.as_ref(),
+                &looping.actions,
+            ),
         }
     }
     true
@@ -183,4 +207,14 @@ fn io_error(what: &str, error: std::io::Error) -> CliError {
     CliError::Backend(HyperVError::backend(RawError::new(format!(
         "{what}: {error}"
     ))))
+}
+
+/// The terminal's image protocol, or `None` when it can only do half blocks
+/// (spec 3.10). Detection never fails the run: a terminal that does not answer
+/// simply looks unsupported and the Thumbnail tab keeps its placeholder.
+fn detect_picker() -> Option<Picker> {
+    match Picker::from_query_stdio() {
+        Ok(picker) if picker.protocol_type() != ProtocolType::Halfblocks => Some(picker),
+        _ => None,
+    }
 }

@@ -67,6 +67,16 @@ pub fn list_body_height(layout: Layout) -> u16 {
     layout.list.height.saturating_sub(LIST_OVERHEAD)
 }
 
+/// The cells the Thumbnail image has to fit: the detail pane's inner width and
+/// the body under the tab bar (spec 3.10, design 5.13). The view draws into the
+/// very same rectangle, so a fetched image always fits.
+pub fn thumbnail_cells(layout: Layout) -> (u16, u16) {
+    (
+        layout.detail.width.saturating_sub(4),
+        layout.detail.height.saturating_sub(3),
+    )
+}
+
 /// The widths of the list columns for an inner width (spec 3.2): only NAME
 /// flexes, everything else keeps the size the specification gives it.
 pub fn list_columns(inner_width: u16) -> ListColumns {

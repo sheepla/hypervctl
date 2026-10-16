@@ -717,3 +717,51 @@ fn the_monitor_tab_breaks_the_line_where_a_sample_is_missing() {
     reduce(&mut state, Action::SelectTab(DetailTab::Monitor));
     compare("monitor-gaps-80x24", &frame(&state, 80, 24));
 }
+
+/// Spec 3.10: on a terminal that cannot show images the Thumbnail tab says so
+/// and never falls back to half blocks.
+#[test]
+fn the_thumbnail_tab_says_when_images_are_unsupported() {
+    let mut state = sample_state(80, 24);
+    state.ui.image_supported = false;
+    reduce(&mut state, Action::SelectTab(DetailTab::Thumbnail));
+    let rows = frame(&state, 80, 24);
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("Thumbnails are not supported by this terminal")),
+        "{rows:?}"
+    );
+    compare("thumbnail-unsupported-80x24", &rows);
+}
+
+/// Spec 3.10: a VM without a console has no preview; the pane names its state.
+#[test]
+fn the_thumbnail_tab_has_no_preview_for_a_vm_without_a_console() {
+    let mut state = sample_state(80, 24);
+    state.ui.image_supported = true;
+    // db-01 is the sample's selection and is Saved (spec 3.10).
+    reduce(&mut state, Action::SelectTab(DetailTab::Thumbnail));
+    let rows = frame(&state, 80, 24);
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("No preview (VM is Saved)")),
+        "{rows:?}"
+    );
+    compare("thumbnail-no-preview-80x24", &rows);
+}
+
+/// Spec 3.10: a Running VM's image is fetched off the loop; until it lands the
+/// pane says it is loading.
+#[test]
+fn the_thumbnail_tab_loads_a_running_vm() {
+    let mut state = sample_state(80, 24);
+    state.ui.image_supported = true;
+    select_down(&mut state, 2); // web-01, the Running VM
+    reduce(&mut state, Action::SelectTab(DetailTab::Thumbnail));
+    let rows = frame(&state, 80, 24);
+    assert!(
+        rows.iter().any(|row| row.contains("Loading...")),
+        "{rows:?}"
+    );
+    compare("thumbnail-loading-80x24", &rows);
+}

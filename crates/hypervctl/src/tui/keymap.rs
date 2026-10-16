@@ -88,6 +88,12 @@ const BINDINGS: &[Binding] = &[
         description: "monitor tab",
     },
     Binding {
+        contexts: BOTH,
+        keys: &[(KeyCode::Char('4'), NONE)],
+        action: Action::SelectTab(DetailTab::Thumbnail),
+        description: "thumbnail tab",
+    },
+    Binding {
         contexts: LIST,
         keys: &[(KeyCode::Char('j'), NONE), (KeyCode::Down, NONE)],
         action: Action::SelectNext,
@@ -340,6 +346,7 @@ fn key_name(code: KeyCode, modifiers: KeyModifiers) -> &'static str {
         (KeyCode::Char('1'), _) => "1",
         (KeyCode::Char('2'), _) => "2",
         (KeyCode::Char('3'), _) => "3",
+        (KeyCode::Char('4'), _) => "4",
         (KeyCode::Char('j'), _) => "j",
         (KeyCode::Char('k'), _) => "k",
         (KeyCode::Char('g'), _) => "g",
@@ -487,6 +494,11 @@ mod tests {
                 action(context, press(KeyCode::Char('3'))),
                 Some(Action::SelectTab(DetailTab::Monitor))
             );
+            // The fourth is the Thumbnail since M13 (spec 3.3).
+            assert_eq!(
+                action(context, press(KeyCode::Char('4'))),
+                Some(Action::SelectTab(DetailTab::Thumbnail))
+            );
         }
     }
 
@@ -580,6 +592,7 @@ mod tests {
         assert!(list.contains(&"Enter detail pane".to_string()), "{list:?}");
         assert!(list.contains(&"/ filter".to_string()), "{list:?}");
         assert!(list.contains(&"3 monitor tab".to_string()), "{list:?}");
+        assert!(list.contains(&"4 thumbnail tab".to_string()), "{list:?}");
         assert!(!list.iter().any(|hint| hint.contains("scroll")), "{list:?}");
 
         let detail = hints(Context::Detail);

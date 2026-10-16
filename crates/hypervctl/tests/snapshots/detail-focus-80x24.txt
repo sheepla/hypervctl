@@ -6,7 +6,7 @@
 │   web-02                          Off              -          -            - │
 └──────────────────────────────────────────────────────────────────────────────┘
 ┏db-01 · Saved━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-┃ Details   Checkpoints   Monitor                                              ┃
+┃ Details   Checkpoints   Monitor   Thumbnail                                  ┃
 ┃ State          Saved                                                         ┃
 ┃ Generation     2                                                             ┃
 ┃ Uptime         -                                                             ┃

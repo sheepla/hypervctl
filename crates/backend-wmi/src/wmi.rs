@@ -13,8 +13,8 @@ use hypervctl_core::{
     AttachedVhd, ChangeEvent, Checkpoint, CheckpointId, CheckpointKind, Controller, ControllerKind,
     HyperV, HyperVError, JobFailReason, JobRef, JobStatus, MemoryConfig, NicConfig, Pending,
     RawError, RequestedState, SwitchDetail, SwitchId, SwitchKind, SwitchSummary, TargetKind,
-    VhdAttachment, VhdFormat, VhdInfo, VhdKind, VlanMode, VlanSettings, VmDetail, VmId, VmState,
-    VmSummary,
+    Thumbnail, VhdAttachment, VhdFormat, VhdInfo, VhdKind, VlanMode, VlanSettings, VmDetail, VmId,
+    VmState, VmSummary,
 };
 use serde::Deserialize;
 use tokio::sync::mpsc;
@@ -463,6 +463,23 @@ fn snapshot_service_path(host: &str) -> String {
     format!(
         "\\\\.\\{NAMESPACE}:Msvm_VirtualSystemSnapshotService.CreationClassName=\"Msvm_VirtualSystemSnapshotService\",Name=\"vssnapsvc\",SystemCreationClassName=\"Msvm_ComputerSystem\",SystemName=\"{host}\""
     )
+}
+
+/// Builds the WMI object path for the virtual system management service, the
+/// singleton that owns `GetVirtualSystemThumbnailImage` (M13). Four-key
+/// composite like the snapshot service; the singleton's `Name` is `vmms`.
+fn management_service_path(host: &str) -> String {
+    format!(
+        "\\\\.\\{NAMESPACE}:Msvm_VirtualSystemManagementService.CreationClassName=\"Msvm_VirtualSystemManagementService\",Name=\"vmms\",SystemCreationClassName=\"Msvm_ComputerSystem\",SystemName=\"{host}\""
+    )
+}
+
+/// Strips the four-byte big-endian length prefix Hyper-V puts in front of the
+/// pixels and decodes the rest as RGB565 (M13-V:
+/// `docs/hypervctl-m13-findings.md`).
+fn decode_thumbnail(width: u16, height: u16, data: &[u8]) -> Option<Thumbnail> {
+    let pixels = data.get(4..)?;
+    Thumbnail::from_rgb565(u32::from(width), u32::from(height), pixels)
 }
 
 /// Builds the WMI object path for a VM's shutdown component (design 3.3,
@@ -948,6 +965,57 @@ impl HyperV for WmiBackend {
             kind: TargetKind::Vhd,
             specified: path.to_string(),
             raw: None,
+        })
+    }
+
+    fn get_thumbnail(
+        &mut self,
+        id: VmId,
+        width: u16,
+        height: u16,
+    ) -> Result<Thumbnail, HyperVError> {
+        let vm_path = vm_object_path(id);
+        let host = host_name();
+        let service = management_service_path(&host);
+        let con = self.connected()?;
+        let out = exec_method_with(
+            con,
+            &service,
+            "Msvm_VirtualSystemManagementService",
+            "GetVirtualSystemThumbnailImage",
+            &[
+                ("TargetSystem", Variant::String(vm_path)),
+                ("WidthPixels", Variant::UI2(width)),
+                ("HeightPixels", Variant::UI2(height)),
+            ],
+        )?;
+        let return_value = return_value(&out)?;
+        if return_value != 0 {
+            // 32775 is both `InvalidState` and the size-refused answer (M13-V);
+            // either way there is no thumbnail to show.
+            return Err(HyperVError::InvalidState {
+                target: Some(id),
+                state: VmState::Unknown(0),
+                operation: "GetVirtualSystemThumbnailImage".to_string(),
+                raw: Some(RawError::new(format!(
+                    "ReturnValue={return_value} (no thumbnail: the VM has no console, \
+                     or the requested size is out of range)"
+                ))),
+            });
+        }
+        let data: Vec<u8> = match out.get_property("ImageData") {
+            Ok(variant) => Vec::<u8>::try_from(variant).map_err(|error| {
+                HyperVError::backend(RawError::new(format!(
+                    "ImageData was not a byte array: {error}"
+                )))
+            })?,
+            Err(error) => return Err(map_wmi_error(error)),
+        };
+        decode_thumbnail(width, height, &data).ok_or_else(|| {
+            HyperVError::backend(RawError::new(format!(
+                "thumbnail data of {} bytes does not match {width}x{height}",
+                data.len()
+            )))
         })
     }
 
@@ -1747,6 +1815,33 @@ mod tests {
         assert!(path.contains(r#"Name="vssnapsvc""#));
         assert!(path.contains(r#"SystemCreationClassName="Msvm_ComputerSystem""#));
         assert!(path.contains(r#"SystemName="WIN11""#));
+    }
+
+    #[test]
+    fn the_management_service_path_is_the_vmms_singleton() {
+        let path = management_service_path("WIN11");
+        assert!(path.contains(r#"CreationClassName="Msvm_VirtualSystemManagementService""#));
+        assert!(path.contains(r#"Name="vmms""#));
+        assert!(path.contains(r#"SystemCreationClassName="Msvm_ComputerSystem""#));
+        assert!(path.contains(r#"SystemName="WIN11""#));
+    }
+
+    #[test]
+    fn thumbnail_data_drops_the_length_prefix_and_decodes_rgb565() {
+        // Two by one: a big-endian length prefix (= 8, the whole buffer) then
+        // one red and one green RGB565 pixel (M13-V).
+        let data = [0x00, 0x00, 0x00, 0x08, 0x00, 0xF8, 0xE0, 0x07];
+        let image = match decode_thumbnail(2, 1, &data) {
+            Some(image) => image,
+            None => panic!("a well-formed buffer must decode"),
+        };
+        assert_eq!(
+            image.rgba,
+            vec![0xFF, 0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF]
+        );
+        // A body shorter than the size claims is refused, not padded.
+        assert!(decode_thumbnail(2, 1, &data[..6]).is_none());
+        assert!(decode_thumbnail(2, 1, &[]).is_none());
     }
 
     #[test]

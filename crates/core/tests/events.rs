@@ -10,7 +10,8 @@ use hypervctl_backend_mock::MockBackend;
 use hypervctl_core::{
     AttachedVhd, BackendActor, BackendHandle, ChangeEvent, ChangeWatcher, Checkpoint, CheckpointId,
     HyperV, HyperVError, JobRef, JobStatus, Pending, RawError, RequestedState, SwitchDetail,
-    SwitchId, SwitchSummary, VhdInfo, VmDetail, VmId, VmSummary, DEBOUNCE, RECONNECT_DELAY,
+    SwitchId, SwitchSummary, Thumbnail, VhdInfo, VmDetail, VmId, VmSummary, DEBOUNCE,
+    RECONNECT_DELAY,
 };
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
@@ -42,6 +43,15 @@ impl HyperV for StreamingBackend {
 
     fn list_vms(&mut self) -> Result<Vec<VmSummary>, HyperVError> {
         Ok(Vec::new())
+    }
+
+    fn get_thumbnail(
+        &mut self,
+        _id: VmId,
+        _width: u16,
+        _height: u16,
+    ) -> Result<Thumbnail, HyperVError> {
+        Err(unused())
     }
 
     fn get_vm(&mut self, _id: VmId) -> Result<VmDetail, HyperVError> {
