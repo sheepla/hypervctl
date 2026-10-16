@@ -15,10 +15,10 @@
 │ │g first                                                                   │ │
 │ │G last                                                                    │ │
 │ │Enter detail pane                                                         │ │
+│ │/ filter                                                                  │ │
+│ │Esc clear filter                                                          │ │
 │ │                                                                          │ │
 │ │Keys of the menu                                                          │ │
-│ │                                                                          │ │
-│ │j/Down move                                                               │ │
 │ └──────────────────────────────────────────────────────────────────────────┘ │
 └──────────────────────────────────────────────────────────── lines 1-12 of 13 ┘
 j/Down scroll  k/Up scroll  g top  G bottom  ? close  Esc close  q/Ctrl+C quit

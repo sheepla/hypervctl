@@ -1,0 +1,24 @@
+┏VMs (4)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ NAME                            STATE          CPU     MEMORY       UPTIME   ┃
+┃ | db-01                           Saved            -          -            - ┃
+┃   ghost                           Unknown(42)      -          -            - ┃
+┃   web-01                          Running          -          -            - ┃
+┃   web-02                          Off              -          -            - ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+┌db-01 · Saved─────────────────────────────────────────────────────────────────┐
+│ Details   Checkpoints                                                        │
+│ State         ┌Actions · db-01───────────────────────────────┐               │
+│ Generation    │ VM is busy                                   │               │
+│ Uptime        │ > Start                     Off/Saved/Paused │               │
+│ CPU           │   Stop                               Running │               │
+│               │   Stop (force)                Running/Paused │               │
+│ Processors    │   Restart                            Running │               │
+│ Memory        │   Restart (force)                    Running │               │
+│               │   Save                               Running │               │
+│ Services      │   Pause                              Running │               │
+│               │   Resume                              Paused │               │
+│ Checkpoints   │   Create checkpoint Running/Off/Saved/Paused │               │
+│ Config        └──────────────────────────────────────────────┘.xml           │
+│ Notes          -                                                             │
+└──────────────────────────────────────────────────────────── lines 1-12 of 13 ┘
+j/Down move  k/Up move  Enter run  Esc close                  db-01: stopping...

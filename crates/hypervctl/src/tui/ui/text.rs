@@ -88,6 +88,15 @@ pub fn pad_right(text: &str, width: usize) -> String {
     format!("{}{}", text, " ".repeat(width - measure(text)))
 }
 
+/// `text` cut to `width` display columns and padded with spaces to exactly
+/// that width, without an ellipsis: every cell of a list column (spec 3.2 and
+/// 3.8) keeps its width, so the columns never shift.
+pub fn pad_fit(text: &str, width: usize) -> String {
+    let text = take_width(text, width);
+    let padding = width.saturating_sub(measure(&text));
+    format!("{text}{}", " ".repeat(padding))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,5 +134,14 @@ mod tests {
         assert_eq!(measure(&pad_right("あい", 6)), 6);
         assert_eq!(pad_right("x", 0), "");
         assert_eq!(take_width("abcdef", 3), "abc");
+    }
+
+    #[test]
+    fn pad_fit_cuts_silently_and_always_fills_the_cell() {
+        assert_eq!(pad_fit("web-01", 8), "web-01  ");
+        // No ellipsis: the cell keeps as much of the name as fits.
+        assert_eq!(pad_fit("web-01", 3), "web");
+        assert_eq!(measure(&pad_fit("あいうえお", 6)), 6);
+        assert_eq!(pad_fit("x", 0), "");
     }
 }

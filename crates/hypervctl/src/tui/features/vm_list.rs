@@ -14,7 +14,7 @@ use crate::cli::output::table::width;
 use crate::cli::output::views::state_label;
 use crate::tui::store::{Focus, State};
 use crate::tui::ui::layout;
-use crate::tui::ui::text::take_width;
+use crate::tui::ui::text::{pad_fit, take_width};
 
 /// The four spinner frames (spec 3.5).
 const SPINNER: [&str; 4] = ["|", "/", "-", "\\"];
@@ -45,8 +45,9 @@ pub fn render(frame: &mut Frame, area: Rect, state: &State) {
     let offset = state.vm_list.offset;
     let items: Vec<ListItem> = state
         .vm_list
-        .items
+        .visible
         .iter()
+        .filter_map(|&index| state.vm_list.items.get(index))
         .skip(offset)
         .take(body_height)
         .map(|vm| ListItem::new(line(vm, columns, state)))
@@ -59,15 +60,24 @@ pub fn render(frame: &mut Frame, area: Rect, state: &State) {
     let list = List::new(items).highlight_style(row_style);
     let selected = state
         .vm_list
-        .selected_index()
+        .visible_index()
         .map(|index| index.saturating_sub(offset));
     let mut list_state = ListState::default().with_selected(selected);
     frame.render_stateful_widget(list, body_area, &mut list_state);
 }
 
-/// The pane title: `VMs (4)`, or with the filter once one exists (spec 3.2).
+/// The pane title: `VMs (4)`, and with a filter in effect `VMs (2/4) /web`
+/// (spec 3.2: the visible count over the whole list, plus the text).
 fn list_title(state: &State) -> String {
-    format!("VMs ({})", state.vm_list.items.len())
+    let total = state.vm_list.items.len();
+    if state.vm_list.filter.text.is_empty() {
+        return format!("VMs ({total})");
+    }
+    format!(
+        "VMs ({}/{total}) /{}",
+        state.vm_list.visible.len(),
+        state.vm_list.filter.text
+    )
 }
 
 /// `[mock]` and `stale 12s` on the top border's right end (spec 3.2).
@@ -87,10 +97,10 @@ fn top_right_label(state: &State) -> Option<String> {
     }
 }
 
-/// ` rows 5-8 of 12 ` on the bottom border's right end, when the list is
-/// scrolled (spec 3.2).
+/// ` rows 5-8 of 12 ` on the bottom border's right end, when the rows that
+/// are shown are scrolled (spec 3.2; the filter counts as the total).
 fn rows_label(state: &State) -> Option<String> {
-    let total = state.vm_list.items.len();
+    let total = state.vm_list.visible.len();
     let body = usize::from(layout::list_body_height(state.ui.layout));
     if body == 0 || total <= body {
         return None;
@@ -106,8 +116,8 @@ fn header_line(columns: layout::ListColumns) -> ratatui::text::Line<'static> {
     let gap = " ".repeat(usize::from(columns.gap));
     ratatui::text::Line::from(format!(
         "{}{gap}{}{gap}{}{gap}{}{gap}{}",
-        pad_right_fit("NAME", usize::from(columns.name)),
-        pad_right_fit("STATE", usize::from(columns.state)),
+        pad_fit("NAME", usize::from(columns.name)),
+        pad_fit("STATE", usize::from(columns.state)),
         pad_left_fit("CPU", usize::from(columns.cpu)),
         pad_left_fit("MEMORY", usize::from(columns.memory)),
         pad_left_fit("UPTIME", usize::from(columns.uptime)),
@@ -134,10 +144,10 @@ fn line(
     let state_text = take_width(&state_label(vm.state), usize::from(columns.state));
     ratatui::text::Line::from(vec![
         ratatui::text::Span::raw(marker),
-        ratatui::text::Span::raw(pad_right_fit(&vm.name, usize::from(columns.name))),
+        ratatui::text::Span::raw(pad_fit(&vm.name, usize::from(columns.name))),
         ratatui::text::Span::raw(gap.clone()),
         ratatui::text::Span::styled(
-            pad_right_fit(&state_text, usize::from(columns.state)),
+            pad_fit(&state_text, usize::from(columns.state)),
             state_style(vm.state),
         ),
         ratatui::text::Span::raw(gap.clone()),
@@ -167,14 +177,8 @@ fn line(
     ])
 }
 
-/// Text cut to `field` columns, padded to it (left or right, caller's
-/// choice), so that every cell has exactly the width of its column.
-fn pad_right_fit(text: &str, field: usize) -> String {
-    let text = take_width(text, field);
-    let padding = field.saturating_sub(width(&text));
-    format!("{text}{}", " ".repeat(padding))
-}
-
+/// Text padded or cut to `field` columns on the left (CPU, MEMORY and UPTIME
+/// are right-aligned), so that every cell has exactly the width of its column.
 fn pad_left_fit(text: &str, field: usize) -> String {
     let text = take_width(text, field);
     let padding = field.saturating_sub(width(&text));

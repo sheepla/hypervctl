@@ -35,12 +35,16 @@ pub struct CheckpointsState {
     /// Which VM these checkpoints belong to; a result for another VM is
     /// discarded (design 5.5).
     pub for_vm: Option<VmId>,
-    /// Tree order: children directly after their parent (spec 3.2).
+    /// Tree order: children directly after their parent, siblings by creation
+    /// time (spec 3.8), as [`crate::tui::ui::tree::order`] lays them out.
     pub items: Vec<Checkpoint>,
     pub selected: Option<CheckpointId>,
     pub last_index: usize,
     /// A fetch is running; do not pile another one up (design 5.5).
     pub in_flight: bool,
+    /// The first row on screen (spec 3.8), kept by the reducer with the same
+    /// scroll arithmetic the view uses.
+    pub offset: usize,
 }
 
 impl CheckpointsState {
@@ -50,7 +54,8 @@ impl CheckpointsState {
         self.items.iter().position(|entry| entry.id == id)
     }
 
-    /// Installs a fresh list for `vm`, keeping the selection by id.
+    /// Installs a fresh list for `vm` in tree order, keeping the selection by
+    /// id.
     ///
     /// Returns the name of the checkpoint that was selected and is gone, so
     /// the caller can tell the user (design 5.6).
@@ -60,7 +65,7 @@ impl CheckpointsState {
             _ => None,
         };
         self.for_vm = Some(vm);
-        self.items = items;
+        self.items = crate::tui::ui::tree::order(items);
         if self.selected.is_some() {
             if let Some(index) = self.selected_index() {
                 self.last_index = index;

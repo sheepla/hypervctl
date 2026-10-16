@@ -13,6 +13,7 @@ pub mod layout;
 pub mod scroll;
 pub mod status;
 pub mod text;
+pub mod tree;
 
 /// Draws one frame of `state` over the whole terminal.
 pub fn draw(frame: &mut Frame, state: &State) {

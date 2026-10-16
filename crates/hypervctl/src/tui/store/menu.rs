@@ -36,13 +36,17 @@ pub const VM_MENU: &[VmMenuItem] = &[
 /// One row of the checkpoint menu (spec 3.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckpointMenuItem {
+    CreateCheckpoint,
     Restore,
     Remove,
 }
 
-/// Every checkpoint menu item, top to bottom.
-pub const CHECKPOINT_MENU: &[CheckpointMenuItem] =
-    &[CheckpointMenuItem::Restore, CheckpointMenuItem::Remove];
+/// Every checkpoint menu item, top to bottom (spec 3.4).
+pub const CHECKPOINT_MENU: &[CheckpointMenuItem] = &[
+    CheckpointMenuItem::CreateCheckpoint,
+    CheckpointMenuItem::Restore,
+    CheckpointMenuItem::Remove,
+];
 
 impl VmMenuItem {
     /// The label on the menu (spec 3.4 spells them out).
@@ -106,19 +110,22 @@ impl CheckpointMenuItem {
     /// The label on the menu.
     pub const fn label(self) -> &'static str {
         match self {
+            Self::CreateCheckpoint => "Create checkpoint",
             Self::Restore => "Restore",
             Self::Remove => "Remove",
         }
     }
 
-    /// Checkpoint operations are always confirmed (spec 3.4).
+    /// Only `Restore` and `Remove` ask before they run; `Create checkpoint`
+    /// goes straight to the runner (spec 3.4).
     pub const fn needs_confirm(self) -> bool {
-        true
+        matches!(self, Self::Restore | Self::Remove)
     }
 
     /// The operation behind the item, as the availability table names it.
     pub const fn op_kind(self) -> OpKind {
         match self {
+            Self::CreateCheckpoint => OpKind::CheckpointCreate,
             Self::Restore => OpKind::CheckpointRestore,
             Self::Remove => OpKind::CheckpointRemove,
         }
@@ -133,8 +140,11 @@ pub fn vm_item_enabled(item: VmMenuItem, state: VmState, op_in_flight: bool) -> 
     !op_in_flight && availability(item.op_kind(), state) == Availability::Ok
 }
 
-/// Whether a checkpoint menu item can run: the same table, plus a checkpoint
-/// being selected at all (spec 3.4, anomaly 21).
+/// Whether each checkpoint menu item can run in `state` right now (spec 3.4,
+/// design 5.7): exactly the cells the availability table calls `Ok`, with an
+/// operation in flight disabling everything (anomaly 19). `Restore` and
+/// `Remove` also need a selected checkpoint; `Create checkpoint` does not
+/// (spec 3.4 and 3.8, anomaly 21).
 pub fn checkpoint_item_enabled(
     item: CheckpointMenuItem,
     state: Option<VmState>,
@@ -144,7 +154,13 @@ pub fn checkpoint_item_enabled(
     let Some(state) = state else {
         return false;
     };
-    !op_in_flight && checkpoint_selected && availability(item.op_kind(), state) == Availability::Ok
+    if op_in_flight {
+        return false;
+    }
+    if !matches!(item, CheckpointMenuItem::CreateCheckpoint) && !checkpoint_selected {
+        return false;
+    }
+    availability(item.op_kind(), state) == Availability::Ok
 }
 
 /// The states in which `item` can run, as the menu shows them next to a grey
@@ -179,5 +195,7 @@ pub fn checkpoint_confirm_question(
         CheckpointMenuItem::Remove => {
             format!("Remove '{checkpoint_name}' of {vm_name}?")
         }
+        // Never asked: Create runs without a dialog (spec 3.4).
+        CheckpointMenuItem::CreateCheckpoint => format!("Create checkpoint on {vm_name}?"),
     }
 }

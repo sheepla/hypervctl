@@ -10,6 +10,8 @@
 │ │g first                                                                   │ │
 │ │G last                                                                    │ │
 │ │Enter detail pane                                                         │ │
+│ │/ filter                                                                  │ │
+│ │Esc clear filter                                                          │ │
 │ │                                                                          │ │
 │ │Keys of the menu                                                          │ │
 │ │                                                                          │ │
@@ -17,8 +19,6 @@
 │ │k/Up move                                                                 │ │
 │ │Enter run                                                                 │ │
 │ │Esc close                                                                 │ │
-│ │                                                                          │ │
-│ │Keys of the confirmation dialog                                           │ │
 │ └──────────────────────────────────────────────────────────────────────────┘ │
 └──────────────────────────────────────────────────────────── lines 1-12 of 13 ┘
 j/Down scroll  k/Up scroll  g top  G bottom  ? close  Esc close  q/Ctrl+C quit

@@ -7,9 +7,9 @@
 └──────────────────────────────────────────────────────────────────────────────┘
 ┏web-02 · Off━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
 ┃ Details   Checkpoints                                                        ┃
-┃ ckpt-1                                                                       ┃
 ┃                                                                              ┃
-┃                                                                              ┃
+┃ NAME                                     TYPE         CREATED                ┃
+┃ > ckpt-1                                   standard     -                    ┃
 ┃             ┌Confirm──────────────────────────────────────────┐              ┃
 ┃             │ Restore 'ckpt-1' of web-02?                     │              ┃
 ┃             │ Changes made since the checkpoint will be lost. │              ┃

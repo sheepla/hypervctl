@@ -62,11 +62,14 @@ pub fn render_menu(frame: &mut Frame, detail: Rect, state: &State) {
             )
         }
         MenuKind::Checkpoint => {
+            // Without a selected checkpoint the menu still opens (spec 3.4):
+            // the title then names the VM it would run on (spec 3.8).
             let name = menu
                 .checkpoint
                 .as_ref()
                 .map(|(_, name)| name.as_str())
-                .unwrap_or("checkpoint");
+                .map(str::to_string)
+                .unwrap_or_else(|| state.vm_list.name_of(menu.vm).unwrap_or_default());
             let rows: Vec<(String, bool, Option<String>)> = CHECKPOINT_MENU
                 .iter()
                 .map(|item| {

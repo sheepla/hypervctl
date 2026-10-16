@@ -14,6 +14,9 @@ pub enum Context {
     Menu,
     Confirm,
     Help,
+    /// The filter input line: it takes the whole keyboard (spec 3.3), so its
+    /// keys are resolved by the resolver, not by a table row.
+    Filter,
 }
 
 const NONE: KeyModifiers = KeyModifiers::empty();
@@ -107,6 +110,18 @@ const BINDINGS: &[Binding] = &[
         keys: &[(KeyCode::Enter, NONE)],
         action: Action::FocusDetail,
         description: "detail pane",
+    },
+    Binding {
+        contexts: LIST,
+        keys: &[(KeyCode::Char('/'), NONE)],
+        action: Action::FilterStart,
+        description: "filter",
+    },
+    Binding {
+        contexts: LIST,
+        keys: &[(KeyCode::Esc, NONE)],
+        action: Action::FilterCancel,
+        description: "clear filter",
     },
     Binding {
         contexts: DETAIL,
@@ -244,6 +259,12 @@ pub fn action(context: Context, key: KeyEvent) -> Option<Action> {
             Some(Action::ConfirmCancel)
         };
     }
+    // The filter input types characters and handles its own control keys,
+    // which no table can say either (spec 3.3): `q` is a letter, `Ctrl+C`
+    // still quits.
+    if context == Context::Filter {
+        return filter_action(key);
+    }
     BINDINGS
         .iter()
         .find(|binding| {
@@ -254,6 +275,34 @@ pub fn action(context: Context, key: KeyEvent) -> Option<Action> {
                     .any(|&(code, modifiers)| matches(&key, code, modifiers))
         })
         .map(|binding| binding.action.clone())
+}
+
+/// What one key of the filter input line asks for (spec 3.3).
+fn filter_action(key: KeyEvent) -> Option<Action> {
+    match key.code {
+        KeyCode::Esc => Some(Action::FilterCancel),
+        KeyCode::Enter => Some(Action::FilterApply),
+        KeyCode::Backspace => Some(Action::FilterBackspace),
+        KeyCode::Up => Some(Action::SelectPrev),
+        KeyCode::Down => Some(Action::SelectNext),
+        KeyCode::Char(character) => {
+            let mut modifiers = key.modifiers;
+            modifiers.remove(KeyModifiers::SHIFT);
+            if modifiers == CONTROL {
+                return match character {
+                    'c' => Some(Action::Quit),
+                    'u' => Some(Action::FilterClear),
+                    _ => None,
+                };
+            }
+            // Every other character, `q` included, is text to match on.
+            if modifiers.is_empty() {
+                return Some(Action::FilterChar(character));
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 /// The key hints of `context`, in the order of the table (design 5.8). The
@@ -278,6 +327,7 @@ fn key_name(code: KeyCode, modifiers: KeyModifiers) -> &'static str {
         (KeyCode::Char('c'), CONTROL) => "Ctrl+C",
         (KeyCode::Char(' '), NONE) => "Space",
         (KeyCode::Char('?'), NONE) => "?",
+        (KeyCode::Char('/'), NONE) => "/",
         (KeyCode::Char('q'), _) => "q",
         (KeyCode::Char('r'), _) => "r",
         (KeyCode::Char('y'), _) => "y",
@@ -443,7 +493,71 @@ mod tests {
     fn a_key_of_the_other_context_does_nothing() {
         assert_eq!(action(Context::List, press(KeyCode::Char('l'))), None);
         assert_eq!(action(Context::Detail, press(KeyCode::Enter)), None);
-        assert_eq!(action(Context::List, press(KeyCode::Esc)), None);
+        // On the list `Esc` clears the filter, which is a no-op without one
+        // (spec 3.3); on the detail pane it goes back to the list instead.
+        assert_eq!(
+            action(Context::List, press(KeyCode::Esc)),
+            Some(Action::FilterCancel)
+        );
+    }
+
+    #[test]
+    fn the_filter_input_types_text_and_keeps_its_own_control_keys() {
+        // Every plain character is text, `q` included (spec 3.3, anomaly 29).
+        assert_eq!(
+            action(Context::Filter, press(KeyCode::Char('q'))),
+            Some(Action::FilterChar('q'))
+        );
+        assert_eq!(
+            action(Context::Filter, press(KeyCode::Char('/'))),
+            Some(Action::FilterChar('/'))
+        );
+        assert_eq!(
+            action(Context::Filter, press(KeyCode::Char('W'))),
+            Some(Action::FilterChar('W'))
+        );
+        // The editing keys (spec 3.3).
+        assert_eq!(
+            action(Context::Filter, press(KeyCode::Backspace)),
+            Some(Action::FilterBackspace)
+        );
+        assert_eq!(
+            action(Context::Filter, press_with(KeyCode::Char('u'), CONTROL)),
+            Some(Action::FilterClear)
+        );
+        assert_eq!(
+            action(Context::Filter, press(KeyCode::Enter)),
+            Some(Action::FilterApply)
+        );
+        assert_eq!(
+            action(Context::Filter, press(KeyCode::Esc)),
+            Some(Action::FilterCancel)
+        );
+        // The selection still moves while the text is being typed.
+        assert_eq!(
+            action(Context::Filter, press(KeyCode::Down)),
+            Some(Action::SelectNext)
+        );
+        assert_eq!(
+            action(Context::Filter, press(KeyCode::Up)),
+            Some(Action::SelectPrev)
+        );
+        // `Ctrl+C` quits even while typing (spec 3.3).
+        assert_eq!(
+            action(Context::Filter, press_with(KeyCode::Char('c'), CONTROL)),
+            Some(Action::Quit)
+        );
+        // Nothing else runs from the filter line.
+        assert_eq!(action(Context::Filter, press(KeyCode::Tab)), None);
+        assert_eq!(
+            action(Context::Filter, press_with(KeyCode::Char('d'), CONTROL)),
+            None
+        );
+        // A VM name may contain a space, so Space types one too.
+        assert_eq!(
+            action(Context::Filter, press(KeyCode::Char(' '))),
+            Some(Action::FilterChar(' '))
+        );
     }
 
     #[test]
@@ -452,6 +566,7 @@ mod tests {
         assert_eq!(list[0], "q/Ctrl+C quit");
         assert!(list.contains(&"j/Down move".to_string()), "{list:?}");
         assert!(list.contains(&"Enter detail pane".to_string()), "{list:?}");
+        assert!(list.contains(&"/ filter".to_string()), "{list:?}");
         assert!(!list.iter().any(|hint| hint.contains("scroll")), "{list:?}");
 
         let detail = hints(Context::Detail);

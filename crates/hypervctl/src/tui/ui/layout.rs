@@ -16,6 +16,11 @@ const UPTIME: u16 = 11;
 /// Everything right of the name column: markers, columns and their gaps.
 const FIXED: u16 = MARKER + GAP + STATE + GAP + CPU + GAP + MEMORY + GAP + UPTIME;
 
+/// The fixed columns of the checkpoints tree (spec 3.8): `production` and a
+/// minute-precision local time are the widest values.
+const KIND: u16 = 11;
+const CREATED: u16 = 16;
+
 /// The narrowest NAME column (spec 3.2).
 const NAME_MIN: u16 = 12;
 
@@ -93,6 +98,37 @@ impl ListColumns {
     /// The width of a whole rendered row, header included.
     pub fn total(self) -> u16 {
         self.marker + self.name + 4 * self.gap + self.state + self.cpu + self.memory + self.uptime
+    }
+}
+
+/// The widths of the checkpoints tree rows for an inner width (spec 3.8):
+/// only the name column flexes, the tree prefix lives inside it.
+pub fn checkpoint_columns(inner_width: u16) -> CheckpointColumns {
+    let fixed = MARKER + GAP + KIND + GAP + CREATED;
+    let name = inner_width.saturating_sub(fixed).max(NAME_MIN);
+    CheckpointColumns {
+        marker: MARKER,
+        name,
+        kind: KIND,
+        created: CREATED,
+        gap: GAP,
+    }
+}
+
+/// One checkpoints tree row's column widths (spec 3.8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckpointColumns {
+    pub marker: u16,
+    pub name: u16,
+    pub kind: u16,
+    pub created: u16,
+    pub gap: u16,
+}
+
+impl CheckpointColumns {
+    /// The width of a whole rendered row, header included.
+    pub fn total(self) -> u16 {
+        self.marker + self.name + 2 * self.gap + self.kind + self.created
     }
 }
 
@@ -223,6 +259,18 @@ mod tests {
         assert_eq!(columns.total(), 76);
         // A tiny inner width still keeps NAME readable.
         assert_eq!(list_columns(10).name, NAME_MIN);
+    }
+
+    #[test]
+    fn the_checkpoint_columns_fit_the_widest_values() {
+        // spec 3.8: TYPE and CREATED are fixed, the name flexes with the tree.
+        let columns = checkpoint_columns(76);
+        assert_eq!(columns.marker, 2);
+        assert_eq!(columns.kind, 11);
+        assert_eq!(columns.created, 16);
+        assert_eq!(columns.name, 76 - 33);
+        assert_eq!(columns.total(), 76);
+        assert_eq!(checkpoint_columns(10).name, NAME_MIN);
     }
 
     #[test]

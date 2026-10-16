@@ -65,6 +65,18 @@ pub fn local_time(when: Option<SystemTime>) -> String {
     }
 }
 
+/// Local wall clock without seconds for the checkpoints tab (spec 3.8):
+/// `2026-10-12 09:30`, `-` when there is no timestamp.
+pub fn local_minutes(when: Option<SystemTime>) -> String {
+    match timestamp(when) {
+        Some(time) => time
+            .with_timezone(&Local)
+            .format("%Y-%m-%d %H:%M")
+            .to_string(),
+        None => "-".to_string(),
+    }
+}
+
 fn timestamp(when: Option<SystemTime>) -> Option<DateTime<Utc>> {
     let since_epoch = when?.duration_since(UNIX_EPOCH).ok()?;
     let seconds = i64::try_from(since_epoch.as_secs()).ok()?;
@@ -133,6 +145,16 @@ mod tests {
         assert!(
             chrono::NaiveDateTime::parse_from_str(&shown, "%Y-%m-%d %H:%M:%S").is_ok(),
             "not a plain local timestamp: {shown}"
+        );
+    }
+
+    #[test]
+    fn checkpoint_times_drop_the_seconds() {
+        assert_eq!(local_minutes(None), "-");
+        let shown = local_minutes(Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000)));
+        assert!(
+            chrono::NaiveDateTime::parse_from_str(&shown, "%Y-%m-%d %H:%M").is_ok(),
+            "not a minute-precision local timestamp: {shown}"
         );
     }
 

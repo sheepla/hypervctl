@@ -3,8 +3,9 @@
 //! `HYPERVCTL_BLESS=1` is set.
 
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
+use chrono::TimeZone;
 use hypervctl_core::{
     Checkpoint, CheckpointId, CheckpointKind, MemoryConfig, VmDetail, VmId, VmState, VmSummary,
 };
@@ -12,6 +13,7 @@ use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 use uuid::Uuid;
 
+use crate::tui::store::status::StatusKind;
 use crate::tui::store::{Action, DetailTab, Focus, Overlay, State};
 use crate::tui::ui;
 
@@ -149,6 +151,17 @@ fn select_down(state: &mut State, steps: usize) {
     }
 }
 
+/// A fixed local wall-clock time: asking the local zone for a plain minute
+/// yields exactly that minute back, so the frames do not depend on the time
+/// zone of the machine that blessed them.
+fn local_at(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> SystemTime {
+    chrono::Local
+        .with_ymd_and_hms(year, month, day, hour, minute, 0)
+        .earliest()
+        .unwrap_or_else(|| unreachable!("a plain wall-clock minute always exists"))
+        .into()
+}
+
 #[test]
 fn the_whole_layout_at_the_minimum_size() {
     let state = sample_state(80, 24);
@@ -230,6 +243,8 @@ fn the_restore_dialog_warns_about_the_changes() {
     // The checkpoint menu only opens from the detail pane (spec 3.3).
     reduce(&mut state, Action::FocusDetail);
     reduce(&mut state, Action::OpenMenu);
+    // The cursor opens on Create; web-02 is Off, so Restore runs next.
+    reduce(&mut state, Action::MenuDown);
     reduce(&mut state, Action::MenuSelect);
     match &state.overlay {
         Overlay::Confirm(confirm) => {
@@ -407,4 +422,187 @@ fn the_stale_age_follows_the_ui_clock() {
     reduce(&mut state, Action::UiTick(since + Duration::from_secs(9)));
     assert_eq!(state.ui.now, since + Duration::from_secs(9));
     assert!(state.needs_ui_tick(), "the age keeps ticking");
+}
+
+/// Anomaly 29: while the input is up the prompt `/<text>_` replaces the hints
+/// and the title counts the rows the filter leaves (spec 3.3).
+#[test]
+fn the_filter_input_shows_its_prompt_and_the_counts() {
+    let mut state = sample_state(80, 24);
+    reduce(&mut state, Action::FilterStart);
+    reduce(&mut state, Action::FilterChar('w'));
+    reduce(&mut state, Action::FilterChar('e'));
+    reduce(&mut state, Action::FilterChar('b'));
+    let rows = frame(&state, 80, 24);
+    // db-01 was selected and is now hidden: web-01 is the first visible row
+    // (spec 3.3) and the title shows shown/total with the filter.
+    assert!(rows[0].contains("VMs (2/4) /web"), "{:?}", rows[0]);
+    assert!(rows[2].contains("> web-01"), "{:?}", rows[2]);
+    assert!(
+        rows[rows.len() - 1].contains("/web_"),
+        "{:?}",
+        rows[rows.len() - 1]
+    );
+    compare("filter-editing-80x24", &rows);
+}
+
+/// Anomaly 29: a filter that matches nothing leaves nothing selected and the
+/// detail pane says so (spec 3.3).
+#[test]
+fn a_filter_matching_nothing_says_so() {
+    let mut state = sample_state(80, 24);
+    reduce(&mut state, Action::FilterStart);
+    for character in "zzz".chars() {
+        reduce(&mut state, Action::FilterChar(character));
+    }
+    reduce(&mut state, Action::FilterApply);
+    let rows = frame(&state, 80, 24);
+    assert!(rows[0].contains("VMs (0/4) /zzz"), "{:?}", rows[0]);
+    assert!(
+        rows.iter().any(|row| row.contains("No matching VMs")),
+        "{rows:?}"
+    );
+    assert!(state.vm_list.selected.is_none());
+    compare("filter-empty-80x24", &rows);
+}
+
+/// Spec 3.8 (anomaly 30): the checkpoints of one VM as a tree, with the
+/// column header, the branch lines, the TYPE column and the local creation
+/// time; the times are fixed wall-clock minutes so the frame is time-zone
+/// independent.
+#[test]
+fn the_checkpoints_tab_draws_the_tree() {
+    let mut state = sample_state(80, 24);
+    reduce(&mut state, Action::SelectTab(DetailTab::Checkpoints));
+    let vm = state
+        .vm_list
+        .selected
+        .unwrap_or_else(|| unreachable!("a VM is always selected in the sample"));
+    let before = Checkpoint {
+        id: CheckpointId::new(Uuid::from_u128(0x100)),
+        name: "before-upgrade".to_string(),
+        kind: CheckpointKind::Standard,
+        created: Some(local_at(2026, 10, 12, 9, 30)),
+        parent_id: None,
+    };
+    let after = Checkpoint {
+        id: CheckpointId::new(Uuid::from_u128(0x200)),
+        name: "after-upgrade".to_string(),
+        kind: CheckpointKind::Standard,
+        created: Some(local_at(2026, 10, 12, 11, 2)),
+        parent_id: Some(before.id),
+    };
+    let hotfix = Checkpoint {
+        id: CheckpointId::new(Uuid::from_u128(0x300)),
+        name: "hotfix-1".to_string(),
+        kind: CheckpointKind::Standard,
+        created: Some(local_at(2026, 10, 13, 15, 41)),
+        parent_id: Some(after.id),
+    };
+    let experiment = Checkpoint {
+        id: CheckpointId::new(Uuid::from_u128(0x400)),
+        name: "experiment".to_string(),
+        kind: CheckpointKind::Production,
+        created: Some(local_at(2026, 10, 14, 8, 15)),
+        parent_id: Some(before.id),
+    };
+    // Scrambled on purpose: the list lays the rows out as a tree.
+    let _ = state.detail.checkpoints.apply(
+        vm,
+        vec![
+            experiment.clone(),
+            hotfix.clone(),
+            after.clone(),
+            before.clone(),
+        ],
+    );
+    state.detail.checkpoints.in_flight = false;
+    let rows = frame(&state, 80, 24);
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("NAME") && row.contains("CREATED")),
+        "{rows:?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.contains("> before-upgrade")),
+        "{rows:?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.contains("├─ after-upgrade")),
+        "{rows:?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.contains("│  └─ hotfix-1")),
+        "{rows:?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.contains("└─ experiment")),
+        "{rows:?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.contains("production")),
+        "{rows:?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.contains("2026-10-12 09:30")),
+        "{rows:?}"
+    );
+    compare("checkpoints-tree-80x24", &rows);
+}
+
+/// The availability table on a Running VM: the greyed rows name the states
+/// that would allow them (spec 3.4).
+#[test]
+fn the_menu_on_a_running_vm_greys_what_it_must() {
+    let mut state = sample_state(80, 24);
+    select_down(&mut state, 2); // web-01, Running
+    reduce(&mut state, Action::OpenMenu);
+    let rows = frame(&state, 80, 24);
+    assert!(
+        rows.iter().any(|row| row.contains("Actions · web-01")),
+        "{rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("Start") && row.contains("Off/Saved/Paused")),
+        "{rows:?}"
+    );
+    compare("menu-running-80x24", &rows);
+}
+
+/// The menu while an operation runs: the busy line and every row grey (spec
+/// 3.4).
+#[test]
+fn the_menu_while_an_operation_runs_says_vm_is_busy() {
+    let mut state = sample_state(80, 24);
+    let selected = state
+        .vm_list
+        .selected
+        .unwrap_or_else(|| unreachable!("a VM is always selected in the sample"));
+    state.ops.start(selected, "stopping".to_string());
+    reduce(&mut state, Action::OpenMenu);
+    let rows = frame(&state, 80, 24);
+    assert!(
+        rows.iter().any(|row| row.contains("VM is busy")),
+        "{rows:?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.contains("Actions · db-01")),
+        "{rows:?}"
+    );
+    compare("menu-busy-80x24", &rows);
+}
+
+/// The message side of the status bar next to the hints (spec 3.5).
+#[test]
+fn the_status_bar_carries_a_message_at_eighty_columns() {
+    let mut state = sample_state(80, 24);
+    state.status.show(StatusKind::Info, "web-01: stopped");
+    let rows = frame(&state, 80, 24);
+    assert!(
+        rows[rows.len() - 1].contains("web-01: stopped"),
+        "{:?}",
+        rows[rows.len() - 1]
+    );
+    compare("status-message-80x24", &rows);
 }

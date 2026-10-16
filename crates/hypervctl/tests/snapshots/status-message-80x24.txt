@@ -1,0 +1,24 @@
+┏VMs (4)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ NAME                            STATE          CPU     MEMORY       UPTIME   ┃
+┃ > db-01                           Saved            -          -            - ┃
+┃   ghost                           Unknown(42)      -          -            - ┃
+┃   web-01                          Running          -          -            - ┃
+┃   web-02                          Off              -          -            - ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+┌db-01 · Saved─────────────────────────────────────────────────────────────────┐
+│ Details   Checkpoints                                                        │
+│ State          Saved                                                         │
+│ Generation     2                                                             │
+│ Uptime         -                                                             │
+│ CPU            -                                                             │
+│                                                                              │
+│ Processors     2                                                             │
+│ Memory         2.0 GB (dynamic 512.0 MB-4.0 GB)                              │
+│                                                                              │
+│ Services       -                                                             │
+│                                                                              │
+│ Checkpoints    1                                                             │
+│ Config         C:\ProgramData\Microsoft\Windows\Hyper-V\web-01.xml           │
+│ Notes          -                                                             │
+└──────────────────────────────────────────────────────────── lines 1-12 of 13 ┘
+q/Ctrl+C quit  Tab focus  r refresh  Space menu  ? help  g first web-01: stopped

@@ -105,7 +105,8 @@ impl State {
             .items
             .sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
         vm_list.selected = vm_list.items.first().map(|vm| vm.id);
-        let vm_count = vm_list.items.len();
+        vm_list.recompute_visible();
+        let vm_count = vm_list.visible.len();
         Self {
             vm_list,
             focus: Focus::List,
@@ -133,16 +134,22 @@ impl State {
     }
 
     /// Which keymap table the keys are looked up in right now (spec 3.3). A
-    /// popup outranks the panes.
+    /// popup outranks the panes; the filter input takes the keyboard whole
+    /// while it is up (spec 3.3).
     pub fn keymap_context(&self) -> keymap::Context {
         match self.overlay {
             Overlay::Menu(_) => keymap::Context::Menu,
             Overlay::Confirm(_) => keymap::Context::Confirm,
             Overlay::Help => keymap::Context::Help,
-            Overlay::None => match self.focus {
-                Focus::List => keymap::Context::List,
-                Focus::Detail => keymap::Context::Detail,
-            },
+            Overlay::None => {
+                if self.vm_list.filter.editing {
+                    return keymap::Context::Filter;
+                }
+                match self.focus {
+                    Focus::List => keymap::Context::List,
+                    Focus::Detail => keymap::Context::Detail,
+                }
+            }
         }
     }
 
@@ -192,6 +199,13 @@ pub enum Action {
     ConfirmCancel,
     ToggleHelp,
     CloseOverlay,
+    // The filter input line (spec 3.3, design 5.11).
+    FilterStart,
+    FilterChar(char),
+    FilterBackspace,
+    FilterClear,
+    FilterApply,
+    FilterCancel,
     // From the terminal, the timers and the change notifications.
     Input(KeyEvent),
     Resize(u16, u16),
@@ -297,6 +311,25 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
             if !matches!(state.overlay, Overlay::None) {
                 state.overlay = Overlay::None;
             }
+        }
+        Action::FilterStart => state.vm_list.filter.editing = true,
+        Action::FilterChar(character) => {
+            state.vm_list.filter.text.push(character);
+            filter_changed(state, &mut effects);
+        }
+        Action::FilterBackspace => {
+            state.vm_list.filter.text.pop();
+            filter_changed(state, &mut effects);
+        }
+        Action::FilterClear => {
+            state.vm_list.filter.text.clear();
+            filter_changed(state, &mut effects);
+        }
+        Action::FilterApply => state.vm_list.filter.editing = false,
+        Action::FilterCancel => {
+            state.vm_list.filter.editing = false;
+            state.vm_list.filter.text.clear();
+            filter_changed(state, &mut effects);
         }
         // A raw key reaches the keymap here, so the mapping stays a pure table
         // lookup and only presses ever become actions (design 5.8, acceptance 12).
@@ -439,9 +472,22 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
     effects
 }
 
-/// The pane rectangles for the list that is actually loaded.
+/// The pane rectangles for the rows that are actually shown: the visible
+/// count feeds the heights, so a filter change re-sizes the panes (spec 3.2,
+/// design 5.11).
 fn recompute_layout(state: &mut State) {
-    state.ui.layout = layout::compute(state.ui.width, state.ui.height, state.vm_list.items.len());
+    state.ui.layout = layout::compute(state.ui.width, state.ui.height, state.vm_list.visible.len());
+}
+
+/// The filter text just changed: the visible rows follow, the selection jumps
+/// to the first visible row when it fell out of the filter (spec 3.3), the
+/// pane heights follow (design 5.11) and the detail tracks the new selection
+/// (design 5.5). Fetching is never filtered (spec 3.3).
+fn filter_changed(state: &mut State, effects: &mut Vec<Effect>) {
+    state.vm_list.recompute_visible();
+    state.vm_list.select_first_visible();
+    recompute_layout(state);
+    follow_selection(state, effects);
 }
 
 /// The scroll motion of `ScrollUp`/`ScrollDown`: the help when it is up, the
@@ -488,10 +534,22 @@ fn scroll_to_edge(state: &mut State, bottom: bool) {
 /// list keeps its selection visible, the detail and the help cannot scroll
 /// past their content.
 fn sync_scrolls(state: &mut State) {
-    let rows = state.vm_list.items.len();
+    let rows = state.vm_list.visible.len();
     let height = layout::list_body_height(state.ui.layout);
-    let index = state.vm_list.selected_index();
+    let index = state.vm_list.visible_index();
     state.vm_list.offset = scroll::visible_range(index, state.vm_list.offset, height, rows);
+    // The checkpoints keep their own selection visible while that tab is up
+    // (spec 3.8).
+    if state.detail.tab == DetailTab::Checkpoints {
+        let total = state.detail.checkpoints.items.len();
+        let index = state.detail.checkpoints.selected_index();
+        state.detail.checkpoints.offset = scroll::visible_range(
+            index,
+            state.detail.checkpoints.offset,
+            layout::detail_body_height(state.ui.layout),
+            total,
+        );
+    }
     let body_rows = features::detail::body_lines(state)
         .len()
         .min(u16::MAX as usize) as u16;
@@ -549,21 +607,25 @@ fn request_checkpoints(state: &mut State, effects: &mut Vec<Effect>) {
 }
 
 /// Opens the action menu for whatever the popup rules say is the target
-/// (spec 3.3): the checkpoint on the Checkpoints tab, the selected VM else.
+/// (spec 3.3): the checkpoint menu on the Checkpoints tab, which opens even
+/// with nothing selected, the selected VM's menu else (spec 3.4).
 fn open_menu(state: &mut State) {
     let Some(vm) = state.vm_list.selected else {
         return;
     };
     if state.focus == Focus::Detail && state.detail.tab == DetailTab::Checkpoints {
-        if let Some(entry) = state.detail.checkpoints.selected_entry() {
-            state.overlay = Overlay::Menu(MenuState {
-                vm,
-                kind: MenuKind::Checkpoint,
-                checkpoint: Some((entry.id, entry.name.clone())),
-                cursor: first_enabled_checkpoint_item(state, vm),
-            });
-            return;
-        }
+        let checkpoint = state
+            .detail
+            .checkpoints
+            .selected_entry()
+            .map(|entry| (entry.id, entry.name.clone()));
+        state.overlay = Overlay::Menu(MenuState {
+            vm,
+            kind: MenuKind::Checkpoint,
+            cursor: first_enabled_checkpoint_item(state, vm, checkpoint.is_some()),
+            checkpoint,
+        });
+        return;
     }
     let cursor = first_enabled_vm_item(state, vm);
     state.overlay = Overlay::Menu(MenuState {
@@ -597,15 +659,18 @@ fn first_enabled_vm_item(state: &State, vm: VmId) -> usize {
 }
 
 /// The first checkpoint menu row that can run (spec 3.4), for the menu on the
-/// Checkpoints tab.
-fn first_enabled_checkpoint_item(state: &State, vm: VmId) -> usize {
+/// Checkpoints tab. `Create checkpoint` needs no selection, so a menu with
+/// nothing selected lands there (spec 3.8).
+fn first_enabled_checkpoint_item(state: &State, vm: VmId, checkpoint_selected: bool) -> usize {
     let Some(vm_state) = vm_state_of(state, vm) else {
         return 0;
     };
     let in_flight = state.ops.in_flight(vm);
     CHECKPOINT_MENU
         .iter()
-        .position(|item| checkpoint_item_enabled(*item, Some(vm_state), true, in_flight))
+        .position(|item| {
+            checkpoint_item_enabled(*item, Some(vm_state), checkpoint_selected, in_flight)
+        })
         .unwrap_or(0)
 }
 
@@ -618,11 +683,12 @@ fn enabled_menu_indices(state: &State, menu: &MenuState) -> Vec<usize> {
                 return Vec::new();
             };
             let in_flight = state.ops.in_flight(menu.vm);
+            let checkpoint_selected = menu.checkpoint.is_some();
             CHECKPOINT_MENU
                 .iter()
                 .enumerate()
                 .filter(|(_, item)| {
-                    checkpoint_item_enabled(**item, Some(vm_state), true, in_flight)
+                    checkpoint_item_enabled(**item, Some(vm_state), checkpoint_selected, in_flight)
                 })
                 .map(|(index, _)| index)
                 .collect()
@@ -721,17 +787,36 @@ fn menu_select(state: &mut State, effects: &mut Vec<Effect>) {
             let Some(item) = CHECKPOINT_MENU.get(menu.cursor).copied() else {
                 return;
             };
-            let Some((checkpoint, checkpoint_name)) = menu.checkpoint.clone() else {
-                return;
-            };
-            // The row may have greyed out since the menu opened: the menu is
-            // the availability table (spec 3.4, anomaly 21).
             let Some(vm_state) = vm_state_of(state, menu.vm) else {
                 return;
             };
-            if !checkpoint_item_enabled(item, Some(vm_state), true, state.ops.in_flight(menu.vm)) {
+            let checkpoint_selected = menu.checkpoint.is_some();
+            // The row may have greyed out since the menu opened: the menu is
+            // the availability table (spec 3.4, anomaly 21).
+            if !checkpoint_item_enabled(
+                item,
+                Some(vm_state),
+                checkpoint_selected,
+                state.ops.in_flight(menu.vm),
+            ) {
                 return;
             }
+            // Create runs right away (spec 3.4) and needs no checkpoint: it is
+            // the one row the menu offers without a selection (spec 3.8).
+            if item == CheckpointMenuItem::CreateCheckpoint {
+                start_operation(
+                    state,
+                    OpRequest::CreateCheckpoint {
+                        vm: menu.vm,
+                        vm_name,
+                    },
+                    effects,
+                );
+                return;
+            }
+            let Some((checkpoint, checkpoint_name)) = menu.checkpoint.clone() else {
+                return;
+            };
             let request = match item {
                 CheckpointMenuItem::Restore => OpRequest::RestoreCheckpoint {
                     vm: menu.vm,
@@ -745,6 +830,8 @@ fn menu_select(state: &mut State, effects: &mut Vec<Effect>) {
                     checkpoint,
                     checkpoint_name: checkpoint_name.clone(),
                 },
+                // Handled above: Create never reaches the dialog (spec 3.4).
+                CheckpointMenuItem::CreateCheckpoint => return,
             };
             if item.needs_confirm() {
                 state.overlay = Overlay::Confirm(ConfirmState {
@@ -1140,6 +1227,9 @@ mod tests {
             menu.checkpoint.as_ref().map(|(_, name)| name.as_str()),
             Some("before-upgrade")
         );
+        // The cursor opens on Create; web-01 is Running, so Restore is grey
+        // and the next row that can run is Remove (spec 3.4).
+        let _ = reduce(&mut state, Action::MenuDown);
         let _ = reduce(&mut state, Action::MenuSelect);
         assert!(matches!(state.overlay, Overlay::Confirm(_)));
     }
@@ -1235,5 +1325,142 @@ mod tests {
         );
         assert!(!state.vm_list.refresh_again);
         assert!(state.vm_list.refresh_in_flight);
+    }
+
+    #[test]
+    fn the_filter_moves_the_selection_only_when_the_target_is_hidden() {
+        // Anomaly 29: typing narrows the rows; a selection the filter still
+        // shows stays put, a hidden one jumps to the first visible row (spec
+        // 3.3), and the fetches stay whole-list.
+        let mut state = sample_state();
+        let web01 = VmId::new(Uuid::from_u128(1 << 96));
+        let db01 = VmId::new(Uuid::from_u128(3 << 96));
+        let _ = reduce(&mut state, Action::FilterStart);
+        // web-01 is selected and "w" keeps it visible: nothing moves.
+        let effects = reduce(&mut state, Action::FilterChar('w'));
+        assert_eq!(state.vm_list.selected, Some(web01));
+        assert_eq!(state.vm_list.visible, vec![2, 3], "web-01 and web-02");
+        assert!(
+            !effects.contains(&Effect::FetchVmList),
+            "the filter fetches nothing, got {effects:?}"
+        );
+        // A filter that hides the selection moves it to the first visible row.
+        let _ = reduce(&mut state, Action::FilterClear);
+        let _ = reduce(&mut state, Action::FilterChar('d'));
+        assert_eq!(state.vm_list.selected, Some(db01));
+        assert_eq!(state.vm_list.visible, vec![0]);
+        // Nothing matches: nothing is selected.
+        let _ = reduce(&mut state, Action::FilterChar('z'));
+        assert!(state.vm_list.visible.is_empty());
+        assert!(state.vm_list.selected.is_none());
+        // Esc closes the input and clears the filter (spec 3.3).
+        let _ = reduce(&mut state, Action::Input(key(KeyCode::Esc)));
+        assert!(!state.vm_list.filter.editing);
+        assert!(state.vm_list.filter.text.is_empty());
+        assert_eq!(state.vm_list.visible.len(), 4);
+        // A refresh under a filter installs the whole list and the display
+        // stays narrowed (spec 3.3: the fetching is never filtered).
+        let _ = reduce(&mut state, Action::FilterChar('d'));
+        let items = state.vm_list.items.clone();
+        let _ = reduce(&mut state, Action::VmListLoaded(Box::new(Ok(items))));
+        assert_eq!(state.vm_list.items.len(), 4);
+        assert_eq!(state.vm_list.visible, vec![0]);
+        assert_eq!(state.vm_list.selected, Some(db01));
+    }
+
+    #[test]
+    fn a_key_while_the_filter_input_is_up_is_text_not_a_command() {
+        // Anomaly 29: with the input up, q types a letter instead of
+        // quitting, and the rows stay drivable (spec 3.3).
+        let mut state = sample_state();
+        let web02 = VmId::new(Uuid::from_u128(2 << 96));
+        let _ = reduce(&mut state, Action::FilterStart);
+        // Arrows still move the selection among the visible rows.
+        let _ = reduce(&mut state, Action::Input(key(KeyCode::Down)));
+        assert_eq!(state.vm_list.selected, Some(web02), "down from web-01");
+        // q types a character: no quit, no overlay, no error.
+        let effects = reduce(&mut state, Action::Input(key(KeyCode::Char('q'))));
+        assert!(effects.is_empty(), "{effects:?}");
+        assert_eq!(state.vm_list.filter.text, "q");
+        assert!(matches!(state.overlay, Overlay::None));
+        // Enter applies the filter and keeps the text for the next edit.
+        let _ = reduce(&mut state, Action::Input(key(KeyCode::Enter)));
+        assert!(!state.vm_list.filter.editing);
+        assert_eq!(state.vm_list.filter.text, "q");
+        // Ctrl+U erases the text while the input stays up (spec 3.3).
+        let _ = reduce(&mut state, Action::FilterStart);
+        let ctrl_u = KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL);
+        let _ = reduce(&mut state, Action::Input(ctrl_u));
+        assert!(state.vm_list.filter.text.is_empty());
+        assert!(state.vm_list.filter.editing);
+    }
+
+    #[test]
+    fn the_checkpoints_are_in_tree_order_and_the_menu_offers_create() {
+        // Anomaly 30: the rows arrive in any order; the list lays them out as
+        // a tree (spec 3.8) and the menu opens without a selection to offer
+        // Create (spec 3.8).
+        let mut state = sample_state();
+        let _ = reduce(&mut state, Action::FocusDetail);
+        let _ = reduce(&mut state, Action::SelectTab(DetailTab::Checkpoints));
+        let vm = VmId::new(Uuid::from_u128(1 << 96));
+        let root = Checkpoint {
+            id: CheckpointId::new(Uuid::from_u128(0x100)),
+            name: "root".to_string(),
+            kind: CheckpointKind::Standard,
+            created: Some(std::time::UNIX_EPOCH + Duration::from_secs(10)),
+            parent_id: None,
+        };
+        let child = Checkpoint {
+            id: CheckpointId::new(Uuid::from_u128(0x200)),
+            name: "child".to_string(),
+            kind: CheckpointKind::Standard,
+            created: Some(std::time::UNIX_EPOCH + Duration::from_secs(20)),
+            parent_id: Some(root.id),
+        };
+        // The provider hands them over in the wrong order on purpose.
+        let vanished = state
+            .detail
+            .checkpoints
+            .apply(vm, vec![child.clone(), root.clone()]);
+        assert_eq!(vanished, None);
+        let names: Vec<&str> = state
+            .detail
+            .checkpoints
+            .items
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["root", "child"], "the child follows its parent");
+        // The selection is kept by id through another scrambled reload.
+        state.detail.checkpoints.selected = Some(child.id);
+        let _ = state
+            .detail
+            .checkpoints
+            .apply(vm, vec![child.clone(), root.clone()]);
+        assert_eq!(state.detail.checkpoints.selected, Some(child.id));
+        assert_eq!(state.detail.checkpoints.selected_index(), Some(1));
+        // Without a selection the menu still opens; Create does not need one
+        // and web-01 is Running, so it runs without a dialog (spec 3.4).
+        state.detail.checkpoints.selected = None;
+        let _ = reduce(&mut state, Action::OpenMenu);
+        let Overlay::Menu(menu) = &state.overlay else {
+            panic!("the checkpoint menu must open");
+        };
+        assert_eq!(menu.kind, MenuKind::Checkpoint);
+        assert!(menu.checkpoint.is_none());
+        assert_eq!(menu.cursor, 0, "Create is the first row that can run");
+        let effects = reduce(&mut state, Action::MenuSelect);
+        assert!(
+            matches!(state.overlay, Overlay::None),
+            "Create runs directly"
+        );
+        assert!(state.ops.in_flight(vm), "the operation started");
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::RunOperation(_))),
+            "{effects:?}"
+        );
     }
 }

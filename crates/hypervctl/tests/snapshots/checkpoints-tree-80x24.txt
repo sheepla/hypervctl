@@ -1,0 +1,24 @@
+┏VMs (4)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ NAME                            STATE          CPU     MEMORY       UPTIME   ┃
+┃ > db-01                           Saved            -          -            - ┃
+┃   ghost                           Unknown(42)      -          -            - ┃
+┃   web-01                          Running          -          -            - ┃
+┃   web-02                          Off              -          -            - ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+┌db-01 · Saved─────────────────────────────────────────────────────────────────┐
+│ Details   Checkpoints                                                        │
+│                                                                              │
+│ NAME                                     TYPE         CREATED                │
+│ > before-upgrade                           standard     2026-10-12 09:30     │
+│   ├─ after-upgrade                         standard     2026-10-12 11:02     │
+│   │  └─ hotfix-1                           standard     2026-10-13 15:41     │
+│   └─ experiment                            production   2026-10-14 08:15     │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+q/Ctrl+C quit  Tab focus  r refresh  Space menu  ? help  1 details tab  g first
