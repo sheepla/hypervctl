@@ -6,7 +6,7 @@
 ┃   web-02                          Off              -          -            - ┃
 ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
 ┌web-01 · Running──────────────────────────────────────────────────────────────┐
-│ Details   Checkpoints                                                        │
+│ Details   Checkpoints   Monitor                                              │
 │ Loading...        ┌Actions · web-01──────────────────────┐                   │
 │                   │   Start             Off/Saved/Paused │                   │
 │                   │ > Stop                               │                   │

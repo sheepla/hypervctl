@@ -3,8 +3,11 @@
 
 use ratatui::layout::{Constraint, Layout as RatLayout, Rect};
 use ratatui::style::{Modifier, Style};
+use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{
+    Axis, Block, Chart, Dataset, GraphType, List, ListItem, ListState, Paragraph,
+};
 use ratatui::Frame;
 
 use hypervctl_core::{Checkpoint, CheckpointKind};
@@ -13,9 +16,9 @@ use crate::cli::output::format;
 use crate::cli::output::table::width;
 use crate::cli::output::views::{state_label, VmDetailView};
 use crate::tui::store::{DetailTab, Focus, State};
-use crate::tui::ui::layout;
 use crate::tui::ui::text::{middle_ellipsis, pad_fit, pad_right, take_width};
 use crate::tui::ui::tree::{tree_rows, TreeRow};
+use crate::tui::ui::{layout, monitor};
 
 use super::vm_list::state_style;
 
@@ -42,6 +45,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &State) {
                 RatLayout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(body_area);
             render_checkpoints(frame, list_area, state);
         }
+        DetailTab::Monitor => render_monitor(frame, body_area, state),
         DetailTab::Details => {
             // The scroll offset comes from the reducer; the view only slices.
             let lines = body_lines(state);
@@ -53,7 +57,8 @@ pub fn render(frame: &mut Frame, area: Rect, state: &State) {
     }
 }
 
-/// `Details   Checkpoints`, the selected tab reversed (spec 3.2).
+/// `Details   Checkpoints   Monitor`, the selected tab reversed (spec 3.2;
+/// `Monitor` since M12).
 fn tab_line(state: &State) -> Line<'static> {
     let selected = Style::new().reversed();
     let plain = Style::new();
@@ -70,6 +75,15 @@ fn tab_line(state: &State) -> Line<'static> {
         Span::styled(
             "Checkpoints",
             if state.detail.tab == DetailTab::Checkpoints {
+                selected
+            } else {
+                plain
+            },
+        ),
+        Span::raw("   "),
+        Span::styled(
+            "Monitor",
+            if state.detail.tab == DetailTab::Monitor {
                 selected
             } else {
                 plain
@@ -115,6 +129,9 @@ fn lines_label(state: &State) -> Option<String> {
             let last = (offset + body).min(total);
             Some(format!(" rows {}-{} of {total} ", offset + 1, last))
         }
+        // The graphs never scroll, so there is no range to report (design
+        // 5.12).
+        DetailTab::Monitor => None,
     }
 }
 
@@ -394,4 +411,116 @@ fn checkpoint_kind_text(kind: CheckpointKind) -> String {
         CheckpointKind::Production => "production".to_string(),
         CheckpointKind::Unknown(raw) => format!("unknown({raw})"),
     }
+}
+
+/// The two graphs of the Monitor tab (spec 3.9): CPU on top, the assigned
+/// memory below. Without samples of its own the pane says so instead of
+/// drawing an empty frame (design 5.12).
+fn render_monitor(frame: &mut Frame, area: Rect, state: &State) {
+    let Some(vm) = state.vm_list.selected else {
+        frame.render_widget(Paragraph::new(Line::raw("No VM selected")), area);
+        return;
+    };
+    let Some(ring) = state.history.ring(vm).filter(|ring| !ring.is_empty()) else {
+        frame.render_widget(Paragraph::new(Line::raw("No samples yet")), area);
+        return;
+    };
+    let window = monitor::window(state.ui.refresh);
+    // The right edge is the newest sample, so a drawn frame never depends on
+    // the wall clock (design 5.12).
+    let now = ring
+        .newest()
+        .unwrap_or_else(|| unreachable!("the ring was just checked non-empty"))
+        .at;
+    let [cpu_area, memory_area] =
+        RatLayout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(area);
+    render_chart(
+        frame,
+        cpu_area,
+        "CPU %",
+        &monitor::series(ring, now, window, monitor::cpu),
+        ChartAxis {
+            y_max: 100.0,
+            y_labels: ["0".to_string(), "50".to_string(), "100".to_string()],
+            // The bottom graph carries the time axis alone (design 5.12).
+            x_labels: None,
+            window,
+        },
+    );
+    let memory_max = monitor::memory_axis_max(ring, now, window);
+    render_chart(
+        frame,
+        memory_area,
+        "Memory assigned",
+        &monitor::series(ring, now, window, monitor::memory),
+        ChartAxis {
+            y_max: memory_max,
+            y_labels: [
+                format::size(0),
+                format::size((memory_max / 2.0) as u64),
+                format::size(memory_max as u64),
+            ],
+            x_labels: Some(monitor::x_labels(window)),
+            window,
+        },
+    );
+}
+
+/// The axes one graph is drawn with (design 5.12).
+struct ChartAxis {
+    y_max: f64,
+    y_labels: [String; 3],
+    x_labels: Option<[String; 2]>,
+    window: std::time::Duration,
+}
+
+/// One graph: the title row, the y labels down the left, the optional x
+/// labels along the bottom, and one [`Dataset`] per unbroken run of samples,
+/// so a gap in the values stays a gap in the line (design 5.12).
+fn render_chart(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    segments: &[monitor::Segment],
+    axis: ChartAxis,
+) {
+    if area.height < 3 || area.width < 4 {
+        return;
+    }
+    // Values outside their axis are clamped instead of drawn off the chart.
+    let points: Vec<Vec<(f64, f64)>> = segments
+        .iter()
+        .map(|segment| {
+            segment
+                .points
+                .iter()
+                .map(|&(x, y)| (x, y.clamp(0.0, axis.y_max)))
+                .collect()
+        })
+        .collect();
+    let datasets: Vec<Dataset> = points
+        .iter()
+        .map(|data| {
+            Dataset::default()
+                .marker(Marker::Dot)
+                .graph_type(GraphType::Line)
+                .data(data)
+        })
+        .collect();
+    // The x bounds always run the window; only the top chart leaves off the
+    // labels (design 5.12). Without the bounds the default `[0.0, 0.0]`
+    // would squash every point into nothing.
+    let mut x_axis = Axis::default().bounds([0.0, axis.window.as_secs_f64()]);
+    if let Some(labels) = axis.x_labels {
+        x_axis = x_axis.labels(labels);
+    }
+    let chart = Chart::new(datasets)
+        .block(Block::default().title(title.to_string()))
+        .x_axis(x_axis)
+        .y_axis(
+            Axis::default()
+                .bounds([0.0, axis.y_max])
+                .labels(axis.y_labels),
+        );
+    frame.render_widget(chart, area);
 }

@@ -10,6 +10,7 @@ use crate::tui::features;
 use crate::tui::store::{Overlay, State, UiState};
 
 pub mod layout;
+pub mod monitor;
 pub mod scroll;
 pub mod status;
 pub mod text;

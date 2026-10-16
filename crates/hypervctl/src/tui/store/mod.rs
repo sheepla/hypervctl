@@ -8,6 +8,7 @@ use crossterm::event::KeyEvent;
 use hypervctl_core::{Checkpoint, HyperVError, VmDetail, VmId, VmState, VmSummary};
 
 pub mod detail;
+pub mod history;
 pub mod menu;
 pub mod ops_state;
 pub mod overlay;
@@ -16,6 +17,7 @@ pub mod vm_list;
 
 use detail::DetailState;
 pub use detail::DetailTab;
+pub use history::History;
 use menu::{
     checkpoint_confirm_question, checkpoint_item_enabled, vm_confirm_question, vm_item_enabled,
     CheckpointMenuItem, VmMenuItem, CHECKPOINT_MENU, VM_MENU,
@@ -56,6 +58,9 @@ pub struct UiState {
     /// The clock the `UiTick` advances: ages like `stale 12s` are read from
     /// here (spec 3.2).
     pub now: Instant,
+    /// How far back the Monitor graphs look (design 5.12): the CLI's
+    /// `--refresh`, defaulting to the CLI default of 2 s.
+    pub refresh: Duration,
 }
 
 impl UiState {
@@ -86,6 +91,9 @@ pub struct State {
     pub overlay: Overlay,
     pub status: StatusState,
     pub ui: UiState,
+    /// The samples of every VM, recorded on every list update whatever tab is
+    /// up (spec 3.9, design 5.12).
+    pub history: History,
     /// How far the help overlay is scrolled (design 5.11).
     pub help_scroll: u16,
     /// The backend actor stopped: the loop ends and the exit code is 1
@@ -127,7 +135,9 @@ impl State {
                 layout: layout::compute(width, height, vm_count),
                 mock: false,
                 now: Instant::now(),
+                refresh: Duration::from_secs(2),
             },
+            history: History::default(),
             help_scroll: 0,
             fatal: None,
         }
@@ -214,8 +224,13 @@ pub enum Action {
     BackendChanged,
     CheckpointsChanged(VmId),
     // The results of the effects. The payloads are boxed so that the action
-    // itself stays small enough to shuffle around the loop.
-    VmListLoaded(Box<Result<Vec<VmSummary>, HyperVError>>),
+    // itself stays small enough to shuffle around the loop. `VmListLoaded`
+    // carries the time the list landed, so the reducer can timestamp the
+    // Monitor samples without reading a clock (design 5.12).
+    VmListLoaded {
+        result: Box<Result<Vec<VmSummary>, HyperVError>>,
+        at: Instant,
+    },
     VmDetailLoaded {
         id: VmId,
         result: Box<Result<VmDetail, HyperVError>>,
@@ -363,10 +378,13 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
                 request_checkpoints(state, &mut effects);
             }
         }
-        Action::VmListLoaded(result) => {
+        Action::VmListLoaded { result, at } => {
             state.vm_list.refresh_in_flight = false;
             match *result {
                 Ok(items) => {
+                    // One sample per VM, while the list still owns the items
+                    // (design 5.12); the rings of vanished VMs go with it.
+                    state.history.record(at, &items);
                     // The name has to be read before the list is replaced, or a
                     // vanished popup target cannot be told apart from an unknown
                     // one (design 5.6).
@@ -501,6 +519,10 @@ fn scroll_by(state: &mut State, delta: isize) {
         }
         return;
     }
+    // The Monitor graphs do not scroll (design 5.12).
+    if state.detail.tab == DetailTab::Monitor {
+        return;
+    }
     if state.focus == Focus::Detail && state.detail.tab == DetailTab::Checkpoints {
         state.detail.checkpoints.move_by(delta);
         return;
@@ -517,6 +539,10 @@ fn scroll_by(state: &mut State, delta: isize) {
 fn scroll_to_edge(state: &mut State, bottom: bool) {
     if matches!(state.overlay, Overlay::Help) {
         state.help_scroll = if bottom { u16::MAX } else { 0 };
+        return;
+    }
+    // The Monitor graphs do not scroll (design 5.12).
+    if state.detail.tab == DetailTab::Monitor {
         return;
     }
     if state.focus == Focus::Detail && state.detail.tab == DetailTab::Checkpoints {
@@ -1064,7 +1090,13 @@ mod tests {
             vm(2, "web-02", VmState::Off),
             vm(3, "db-01", VmState::Saved),
         ];
-        let _ = reduce(&mut state, Action::VmListLoaded(Box::new(Ok(remaining))));
+        let _ = reduce(
+            &mut state,
+            Action::VmListLoaded {
+                result: Box::new(Ok(remaining)),
+                at: Instant::now(),
+            },
+        );
         assert!(matches!(state.overlay, Overlay::None));
         let text = state
             .status
@@ -1314,7 +1346,13 @@ mod tests {
         assert!(state.vm_list.refresh_again);
         // When the fetch lands, exactly one catch-up fetch starts.
         let items = state.vm_list.items.clone();
-        let loaded = reduce(&mut state, Action::VmListLoaded(Box::new(Ok(items))));
+        let loaded = reduce(
+            &mut state,
+            Action::VmListLoaded {
+                result: Box::new(Ok(items)),
+                at: Instant::now(),
+            },
+        );
         assert!(
             loaded
                 .iter()
@@ -1362,7 +1400,13 @@ mod tests {
         // stays narrowed (spec 3.3: the fetching is never filtered).
         let _ = reduce(&mut state, Action::FilterChar('d'));
         let items = state.vm_list.items.clone();
-        let _ = reduce(&mut state, Action::VmListLoaded(Box::new(Ok(items))));
+        let _ = reduce(
+            &mut state,
+            Action::VmListLoaded {
+                result: Box::new(Ok(items)),
+                at: Instant::now(),
+            },
+        );
         assert_eq!(state.vm_list.items.len(), 4);
         assert_eq!(state.vm_list.visible, vec![0]);
         assert_eq!(state.vm_list.selected, Some(db01));
@@ -1461,6 +1505,91 @@ mod tests {
                 .iter()
                 .any(|effect| matches!(effect, Effect::RunOperation(_))),
             "{effects:?}"
+        );
+    }
+
+    #[test]
+    fn the_monitor_history_adds_no_backend_call_of_its_own() {
+        // Anomaly 31: the samples ride along with the list fetch that
+        // already runs, whichever tab is up, and opening the Monitor tab
+        // asks the backend for nothing.
+        let mut state = sample_state();
+        let web01 = VmId::new(Uuid::from_u128(1 << 96));
+        let base = Instant::now();
+        let mut seen: Vec<Effect> = Vec::new();
+        // Two refresh cycles while the Details tab is up.
+        for step in 0..2u64 {
+            seen.extend(reduce(&mut state, Action::RefreshTick));
+            let items = state.vm_list.items.clone();
+            seen.extend(reduce(
+                &mut state,
+                Action::VmListLoaded {
+                    result: Box::new(Ok(items)),
+                    at: base + Duration::from_secs(step * 2),
+                },
+            ));
+        }
+        assert_eq!(
+            state.history.ring(web01).map(|ring| ring.iter().count()),
+            Some(2),
+            "the samples were recorded while another tab was up"
+        );
+        // Switching to the Monitor asks for nothing at all.
+        let monitor = reduce(&mut state, Action::SelectTab(DetailTab::Monitor));
+        assert!(monitor.is_empty(), "{monitor:?}");
+        // No effect beyond the ones the TUI already had before M12.
+        for effect in &seen {
+            assert!(
+                matches!(
+                    effect,
+                    Effect::FetchVmList | Effect::FetchVmDetail(_) | Effect::FetchCheckpoints(_)
+                ),
+                "the monitor must not add an effect: {effect:?}"
+            );
+        }
+        let fetches = seen
+            .iter()
+            .filter(|effect| **effect == Effect::FetchVmList)
+            .count();
+        assert_eq!(fetches, 2, "one list fetch per refresh tick");
+    }
+
+    #[test]
+    fn a_vm_leaving_the_list_takes_its_samples_with_it() {
+        // Anomaly 31: the history follows the whole list, not the screen.
+        let mut state = sample_state();
+        let web01 = VmId::new(Uuid::from_u128(1 << 96));
+        let ghost = VmId::new(Uuid::from_u128(4 << 96));
+        let items = state.vm_list.items.clone();
+        let _ = reduce(
+            &mut state,
+            Action::VmListLoaded {
+                result: Box::new(Ok(items)),
+                at: Instant::now(),
+            },
+        );
+        assert!(state.history.ring(ghost).is_some());
+        let remaining: Vec<VmSummary> = state
+            .vm_list
+            .items
+            .iter()
+            .filter(|vm| vm.id != ghost)
+            .cloned()
+            .collect();
+        let _ = reduce(
+            &mut state,
+            Action::VmListLoaded {
+                result: Box::new(Ok(remaining)),
+                at: Instant::now(),
+            },
+        );
+        assert!(
+            state.history.ring(ghost).is_none(),
+            "the vanished VM is gone"
+        );
+        assert_eq!(
+            state.history.ring(web01).map(|ring| ring.iter().count()),
+            Some(2)
         );
     }
 }

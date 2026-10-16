@@ -10,6 +10,7 @@
 │ │? help                                                                    │ │
 │ │1 details tab                                                             │ │
 │ │2 checkpoints tab                                                         │ │
+│ │3 monitor tab                                                             │ │
 │ │j/Down move                                                               │ │
 │ │k/Up move                                                                 │ │
 │ │g first                                                                   │ │
@@ -18,7 +19,6 @@
 │ │/ filter                                                                  │ │
 │ │Esc clear filter                                                          │ │
 │ │                                                                          │ │
-│ │Keys of the menu                                                          │ │
 │ └──────────────────────────────────────────────────────────────────────────┘ │
 └──────────────────────────────────────────────────────────── lines 1-12 of 13 ┘
 j/Down scroll  k/Up scroll  g top  G bottom  ? close  Esc close  q/Ctrl+C quit

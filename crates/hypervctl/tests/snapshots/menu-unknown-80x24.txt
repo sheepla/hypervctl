@@ -6,7 +6,7 @@
 ┃   web-02                          Off              -          -            - ┃
 ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
 ┌ghost · Unknown(42)───────────────────────────────────────────────────────────┐
-│ Details   Checkpoints                                                        │
+│ Details   Checkpoints   Monitor                                              │
 │ Loading...    ┌Actions · ghost───────────────────────────────┐               │
 │               │ VM state is unknown                          │               │
 │               │ > Start                     Off/Saved/Paused │               │

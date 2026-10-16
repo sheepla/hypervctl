@@ -23,7 +23,12 @@ pub fn spawn(
             let actions = actions.clone();
             tokio::spawn(async move {
                 let result = handle.list_vms().await;
-                let _ = actions.send(Action::VmListLoaded(Box::new(result)));
+                // The time the list lands carries the samples the Monitor
+                // records (design 5.12).
+                let _ = actions.send(Action::VmListLoaded {
+                    result: Box::new(result),
+                    at: Instant::now(),
+                });
             });
         }
         Effect::FetchVmDetail(id) => {

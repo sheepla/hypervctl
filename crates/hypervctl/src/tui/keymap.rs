@@ -82,6 +82,12 @@ const BINDINGS: &[Binding] = &[
         description: "checkpoints tab",
     },
     Binding {
+        contexts: BOTH,
+        keys: &[(KeyCode::Char('3'), NONE)],
+        action: Action::SelectTab(DetailTab::Monitor),
+        description: "monitor tab",
+    },
+    Binding {
         contexts: LIST,
         keys: &[(KeyCode::Char('j'), NONE), (KeyCode::Down, NONE)],
         action: Action::SelectNext,
@@ -333,6 +339,7 @@ fn key_name(code: KeyCode, modifiers: KeyModifiers) -> &'static str {
         (KeyCode::Char('y'), _) => "y",
         (KeyCode::Char('1'), _) => "1",
         (KeyCode::Char('2'), _) => "2",
+        (KeyCode::Char('3'), _) => "3",
         (KeyCode::Char('j'), _) => "j",
         (KeyCode::Char('k'), _) => "k",
         (KeyCode::Char('g'), _) => "g",
@@ -475,6 +482,11 @@ mod tests {
                 action(context, press(KeyCode::Char('2'))),
                 Some(Action::SelectTab(DetailTab::Checkpoints))
             );
+            // The third tab is the Monitor since M12 (spec 3.3).
+            assert_eq!(
+                action(context, press(KeyCode::Char('3'))),
+                Some(Action::SelectTab(DetailTab::Monitor))
+            );
         }
     }
 
@@ -567,6 +579,7 @@ mod tests {
         assert!(list.contains(&"j/Down move".to_string()), "{list:?}");
         assert!(list.contains(&"Enter detail pane".to_string()), "{list:?}");
         assert!(list.contains(&"/ filter".to_string()), "{list:?}");
+        assert!(list.contains(&"3 monitor tab".to_string()), "{list:?}");
         assert!(!list.iter().any(|hint| hint.contains("scroll")), "{list:?}");
 
         let detail = hints(Context::Detail);

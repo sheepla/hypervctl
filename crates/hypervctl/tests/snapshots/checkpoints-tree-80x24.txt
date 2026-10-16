@@ -6,7 +6,7 @@
 ┃   web-02                          Off              -          -            - ┃
 ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
 ┌db-01 · Saved─────────────────────────────────────────────────────────────────┐
-│ Details   Checkpoints                                                        │
+│ Details   Checkpoints   Monitor                                              │
 │                                                                              │
 │ NAME                                     TYPE         CREATED                │
 │ > before-upgrade                           standard     2026-10-12 09:30     │

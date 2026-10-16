@@ -47,8 +47,10 @@ pub async fn run(
         .size()
         .map_err(|error| io_error("reading the terminal size", error))?;
     let mut state = State::new(items, size.width, size.height);
-    // The list title says `[mock]` when the mock backend runs (spec 3.2).
+    // The list title says `[mock]` when the mock backend runs (spec 3.2), and
+    // the Monitor window follows the refresh interval (design 5.12).
     state.ui.mock = mock;
+    state.ui.refresh = refresh;
 
     // Step 5: change notifications, keys and the timers.
     let (actions, mut incoming) = mpsc::unbounded_channel();

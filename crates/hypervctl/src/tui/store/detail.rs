@@ -3,11 +3,12 @@
 
 use hypervctl_core::{Checkpoint, CheckpointId, VmDetail, VmId};
 
-/// The tabs of the detail pane (spec 3.2).
+/// The tabs of the detail pane (spec 3.2; `Monitor` since M12).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DetailTab {
     Details,
     Checkpoints,
+    Monitor,
 }
 
 impl DetailTab {
@@ -15,15 +16,17 @@ impl DetailTab {
     pub const fn next(self) -> Self {
         match self {
             Self::Details => Self::Checkpoints,
-            Self::Checkpoints => Self::Details,
+            Self::Checkpoints => Self::Monitor,
+            Self::Monitor => Self::Details,
         }
     }
 
     /// The tab to the left, wrapping around.
     pub const fn previous(self) -> Self {
         match self {
-            Self::Details => Self::Checkpoints,
+            Self::Details => Self::Monitor,
             Self::Checkpoints => Self::Details,
+            Self::Monitor => Self::Checkpoints,
         }
     }
 }
@@ -156,5 +159,21 @@ impl DetailState {
             self.checkpoints = CheckpointsState::default();
             self.scroll = 0;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DetailTab;
+
+    #[test]
+    fn the_three_tabs_cycle_in_the_order_of_the_pane() {
+        use DetailTab::*;
+        assert_eq!(Details.next(), Checkpoints);
+        assert_eq!(Checkpoints.next(), Monitor);
+        assert_eq!(Monitor.next(), Details);
+        assert_eq!(Details.previous(), Monitor);
+        assert_eq!(Monitor.previous(), Checkpoints);
+        assert_eq!(Checkpoints.previous(), Details);
     }
 }

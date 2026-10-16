@@ -606,3 +606,114 @@ fn the_status_bar_carries_a_message_at_eighty_columns() {
     );
     compare("status-message-80x24", &rows);
 }
+
+/// The selected VM without a single sample says so instead of drawing an
+/// empty chart (spec 3.9, design 5.12).
+#[test]
+fn the_monitor_tab_without_history_says_so() {
+    let mut state = sample_state(80, 24);
+    select_down(&mut state, 2); // web-01, the Running VM
+    reduce(&mut state, Action::SelectTab(DetailTab::Monitor));
+    let rows = frame(&state, 80, 24);
+    // The tab row sits under the list pane and the detail pane's top border.
+    let tab_row = state.ui.layout.list.height as usize + 1;
+    assert!(rows[tab_row].contains("Monitor"), "{:?}", rows[tab_row]);
+    assert!(
+        rows.iter().any(|row| row.contains("No samples yet")),
+        "{rows:?}"
+    );
+    compare("monitor-empty-80x24", &rows);
+}
+
+/// Records `count` samples of `vm`, one every `step` seconds, under the
+/// given value curves. The graph takes its right edge from the newest
+/// sample, so the drawn frame depends on the samples alone (design 5.12).
+fn record_samples(
+    state: &mut State,
+    vm: &VmSummary,
+    count: usize,
+    step: u64,
+    cpu: impl Fn(usize) -> Option<f64>,
+    memory: impl Fn(usize) -> Option<u64>,
+) {
+    let base = Instant::now();
+    for index in 0..count {
+        let item = VmSummary {
+            cpu_usage_percent: cpu(index),
+            memory_assigned_bytes: memory(index),
+            ..vm.clone()
+        };
+        state.history.record(
+            base + Duration::from_secs(step * index as u64),
+            std::slice::from_ref(&item),
+        );
+    }
+}
+
+/// Spec 3.9: the CPU graph on top, the memory graph below, over a ten minute
+/// window with `-10m` and `now` at its ends.
+#[test]
+fn the_monitor_tab_draws_both_graphs_over_the_window() {
+    let mut state = sample_state(80, 24);
+    select_down(&mut state, 2); // web-01
+    let web01 = state
+        .vm_list
+        .items
+        .iter()
+        .find(|vm| vm.name == "web-01")
+        .cloned()
+        .unwrap_or_else(|| unreachable!("the fixture contains web-01"));
+    // 61 samples ten seconds apart fill the whole window.
+    record_samples(
+        &mut state,
+        &web01,
+        61,
+        10,
+        |index| Some(5.0 + index as f64),
+        |index| Some(1536 * 1024 * 1024 + index as u64 * 16 * 1024 * 1024),
+    );
+    reduce(&mut state, Action::SelectTab(DetailTab::Monitor));
+    let rows = frame(&state, 80, 24);
+    assert!(rows.iter().any(|row| row.contains("CPU %")), "{rows:?}");
+    assert!(
+        rows.iter().any(|row| row.contains("Memory assigned")),
+        "{rows:?}"
+    );
+    assert!(rows.iter().any(|row| row.contains("-10m")), "{rows:?}");
+    assert!(rows.iter().any(|row| row.contains("now")), "{rows:?}");
+    // The lines are drawn with the dot marker (spec 3.9).
+    assert!(
+        rows.iter().filter(|row| row.contains('•')).count() >= 2,
+        "both graphs must carry dots: {rows:?}"
+    );
+    compare("monitor-80x24", &rows);
+}
+
+/// Spec 3.9: a stretch of missing CPU samples tears the top line in two
+/// instead of drawing through it or flat at zero.
+#[test]
+fn the_monitor_tab_breaks_the_line_where_a_sample_is_missing() {
+    let mut state = sample_state(80, 24);
+    select_down(&mut state, 2); // web-01
+    let web01 = state
+        .vm_list
+        .items
+        .iter()
+        .find(|vm| vm.name == "web-01")
+        .cloned()
+        .unwrap_or_else(|| unreachable!("the fixture contains web-01"));
+    record_samples(
+        &mut state,
+        &web01,
+        61,
+        10,
+        // The middle two minutes have no CPU number at all.
+        |index| match index {
+            20..=31 => None,
+            _ => Some(50.0),
+        },
+        |_| Some(2048 * 1024 * 1024),
+    );
+    reduce(&mut state, Action::SelectTab(DetailTab::Monitor));
+    compare("monitor-gaps-80x24", &frame(&state, 80, 24));
+}
