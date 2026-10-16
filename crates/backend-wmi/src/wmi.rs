@@ -457,17 +457,6 @@ fn requested_state_value(request: RequestedState) -> u16 {
     }
 }
 
-/// Target `EnabledState` once the request finishes; used for
-/// `Pending::AwaitState` and for idempotency checks upstream.
-fn target_enabled_state(request: RequestedState) -> VmState {
-    match request {
-        RequestedState::Start | RequestedState::Resume | RequestedState::Reset => VmState::Running,
-        RequestedState::ShutDown | RequestedState::TurnOff => VmState::Off,
-        RequestedState::Save => VmState::Saved,
-        RequestedState::Pause => VmState::Paused,
-    }
-}
-
 /// Builds the WMI object path for the snapshot service (M0 item 6: four-key
 /// composite; `SystemName` is the host name).
 fn snapshot_service_path(host: &str) -> String {
@@ -593,6 +582,22 @@ fn exec_method_with(
                 "WMI method {method_name} returned no out-params"
             )))
         })
+}
+
+/// Classifies a failed job's `ErrorCode` into the hint the spec shows
+/// (design 3.8.2, spec 2.12): a pure function of the code alone, because the
+/// provider's message is localized (design 3.7.6). Both observed shapes are
+/// matched: the HRESULT-style value `Msvm_ConcreteJob.ErrorCode` carries
+/// (design 3.7.9) and the raw codes the M0 probe recorded for the very same
+/// failures (m0-findings: 32768 = guest not ready, 32778 = out of memory,
+/// 32770 = unsupported). Everything unclassified keeps `Other`: only `-v`
+/// explains those.
+fn job_fail_reason(code: u32) -> JobFailReason {
+    match code {
+        0x8007_10DF | 32768 => JobFailReason::GuestNotReady,
+        0x8007_000E | 32778 => JobFailReason::HostOutOfMemory,
+        _ => JobFailReason::Other,
+    }
 }
 
 /// Maps a `RequestStateChange` / snapshot-method result onto `Pending`.
@@ -961,13 +966,11 @@ impl HyperV for WmiBackend {
             "RequestStateChange",
             &[("RequestedState", Variant::UI2(state_value))],
         )?;
-        // Guest shutdown has no job when Hyper-V accepts it; the state is the
-        // progress (design 3.1). Other requests return 4096+Job or 0.
-        let pending = pending_from_method(&out, "RequestStateChange")?;
-        if request == RequestedState::ShutDown && matches!(pending, Pending::Job(_)) {
-            return Ok(Pending::AwaitState(id, target_enabled_state(request)));
-        }
-        Ok(pending)
+        // Design 3.1/3.7.3: ShutDown answers with a job like every other
+        // power request; flattening it into a state wait would swallow the
+        // job's failure, and a refused shutdown (the guest is not ready,
+        // anomaly 16) has to surface as `JobFailed` instead.
+        pending_from_method(&out, "RequestStateChange")
     }
 
     fn create_checkpoint(&mut self, vm: VmId) -> Result<Pending, HyperVError> {
@@ -1010,11 +1013,12 @@ impl HyperV for WmiBackend {
         )?;
         let return_value = return_value(&out)?;
         if return_value != 0 {
-            // 0x800710DF is the guest-not-ready code seen on real hardware
-            // (M0 item 5, V10). `InitiateReboot` gives no provider text.
+            // The provider gives no text here; the code alone decides the
+            // hint (design 3.8.2, m0-findings: `0x800710DF` when the guest is
+            // not ready).
             return Err(HyperVError::JobFailed {
                 code: return_value,
-                reason: hypervctl_core::JobFailReason::GuestNotReady,
+                reason: job_fail_reason(return_value),
                 raw: None,
             });
         }
@@ -1106,16 +1110,18 @@ impl HyperV for WmiBackend {
             .ok_or_else(|| HyperVError::backend(RawError::new(format!("unknown job '{id}'"))))?;
         // M0 item 6 / design 3.7.6: JobState 7=Completed, 10=Exception.
         // Message text is localized (Japanese on this host) so only the code
-        // is carried into the error.
+        // is carried into the error; the hint comes from the code alone
+        // (design 3.8.2).
         match row.job_state {
             7 => Ok(JobStatus::Succeeded),
-            10 => Ok(JobStatus::Failed {
-                code: row.error_code.unwrap_or(0),
-                message: row.error_description.unwrap_or_default(),
-                // M11-W1 replaces this with the classification from the code
-                // (design 3.8.2); unclassified means "no hint" per spec 2.12.
-                reason: JobFailReason::Other,
-            }),
+            10 => {
+                let code = row.error_code.unwrap_or(0);
+                Ok(JobStatus::Failed {
+                    code,
+                    message: row.error_description.unwrap_or_default(),
+                    reason: job_fail_reason(code),
+                })
+            }
             // CIM: 3=Starting, 4=Running, 5=Canceling, 6=Completed with
             // warnings handled as Succeeded above only when 7.
             11 | 12 => Ok(JobStatus::Cancelled),
@@ -1704,23 +1710,34 @@ mod tests {
     }
 
     #[test]
-    fn target_states_match_the_request() {
-        assert_eq!(
-            target_enabled_state(RequestedState::Start),
-            VmState::Running
+    fn job_fail_reasons_classify_both_observed_code_shapes() {
+        // Design 3.8.2: the HRESULT-style codes of design 3.7.9.
+        assert_eq!(job_fail_reason(0x8007_10DF), JobFailReason::GuestNotReady);
+        assert_eq!(job_fail_reason(0x8007_000E), JobFailReason::HostOutOfMemory);
+        // m0-findings: the same failures as the raw `ErrorCode` values the
+        // job rows showed on real hardware (32768 / 32778 / 32770).
+        assert_eq!(job_fail_reason(32768), JobFailReason::GuestNotReady);
+        assert_eq!(job_fail_reason(32778), JobFailReason::HostOutOfMemory);
+        // Unsupported operations carry no hint of their own (spec 2.12).
+        assert_eq!(job_fail_reason(0x8007_0032), JobFailReason::Other);
+        assert_eq!(job_fail_reason(32770), JobFailReason::Other);
+        // Anything else stays unclassified; only `-v` explains it.
+        assert_eq!(job_fail_reason(0), JobFailReason::Other);
+        assert_eq!(job_fail_reason(0x8004_1003), JobFailReason::Other);
+    }
+
+    #[test]
+    fn checkpoint_rename_reports_it_is_unverified() {
+        // Design 3.8: the rename method is confirmed by M11-V (V4) only;
+        // until then the backend reports clearly instead of guessing.
+        let mut backend = WmiBackend::connect_or_unavailable();
+        let error = backend
+            .rename_checkpoint(CheckpointId::new(uuid::Uuid::nil()), "wanted")
+            .expect_err("rename waits for the M11-V result");
+        assert!(
+            error.to_string().contains("not verified on real hardware"),
+            "{error}"
         );
-        assert_eq!(
-            target_enabled_state(RequestedState::Resume),
-            VmState::Running
-        );
-        assert_eq!(
-            target_enabled_state(RequestedState::Reset),
-            VmState::Running
-        );
-        assert_eq!(target_enabled_state(RequestedState::ShutDown), VmState::Off);
-        assert_eq!(target_enabled_state(RequestedState::TurnOff), VmState::Off);
-        assert_eq!(target_enabled_state(RequestedState::Save), VmState::Saved);
-        assert_eq!(target_enabled_state(RequestedState::Pause), VmState::Paused);
     }
 
     #[test]

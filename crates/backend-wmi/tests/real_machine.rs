@@ -13,7 +13,9 @@
 #![cfg(windows)]
 
 use hypervctl_backend_wmi::WmiBackend;
-use hypervctl_core::{HyperV, HyperVError, RequestedState, TargetKind, VmId, VmState};
+use hypervctl_core::{
+    HyperV, HyperVError, JobFailReason, RequestedState, TargetKind, VmId, VmState,
+};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 /// Prefix every mutation test requires; see design 6.2.
@@ -416,4 +418,124 @@ fn job_status_reports_unknown_jobs_as_backend_errors() {
         ),
         "expected NotFound or Backend, got: {error}"
     );
+}
+
+/// Brings `id` to Running the direct way: force off first, then start.
+fn ensure_running(backend: &mut WmiBackend, id: VmId) {
+    if backend.get_vm(id).expect("get_vm").summary.state == VmState::Running {
+        return;
+    }
+    if backend.get_vm(id).expect("get_vm").summary.state != VmState::Off {
+        backend
+            .request_vm_state(id, RequestedState::TurnOff)
+            .expect("turn off");
+        wait_for_state(backend, id, VmState::Off);
+    }
+    backend
+        .request_vm_state(id, RequestedState::Start)
+        .expect("start");
+    wait_for_state(backend, id, VmState::Running);
+}
+
+/// The hint `code` must have produced (design 3.8.2); duplicated here so the
+/// wiring between `job_status` and the classification is what is asserted.
+fn expected_reason(code: u32) -> JobFailReason {
+    match code {
+        0x8007_10DF | 32768 => JobFailReason::GuestNotReady,
+        0x8007_000E | 32778 => JobFailReason::HostOutOfMemory,
+        _ => JobFailReason::Other,
+    }
+}
+
+#[test]
+#[ignore = "requires a Windows host with Hyper-V"]
+fn shutdown_of_a_running_vm_answers_with_a_job_not_a_state_wait() {
+    let _guard = mutation_lock();
+    let mut backend = must_connect(backend());
+    let id = must_find_test_vm(&mut backend);
+    assert_safe_vm(&mut backend, id);
+    ensure_running(&mut backend, id);
+
+    let pending = backend
+        .request_vm_state(id, RequestedState::ShutDown)
+        .expect("shutdown");
+    // Design 3.1: ShutDown answers with a job (or an immediate 0); the old
+    // AwaitState flattening would swallow the job's failure (anomaly 16).
+    let job = match pending {
+        hypervctl_core::Pending::Job(job) => Some(job),
+        hypervctl_core::Pending::Done => None,
+        other => panic!("ShutDown must answer with a job, not {other:?}"),
+    };
+
+    if let Some(job) = job {
+        let mut refusal = None;
+        for _ in 0..120 {
+            match backend.job_status(job.clone()).expect("job_status") {
+                hypervctl_core::JobStatus::Succeeded => break,
+                hypervctl_core::JobStatus::Failed { code, reason, .. } => {
+                    refusal = Some((code, reason));
+                    break;
+                }
+                hypervctl_core::JobStatus::Cancelled => {
+                    panic!("the shutdown job was cancelled")
+                }
+                _ => std::thread::sleep(std::time::Duration::from_millis(500)),
+            }
+        }
+        if let Some((code, reason)) = refusal {
+            // The refusal must carry the hint its code decides (design
+            // 3.8.2), and the VM stays Running behind it (anomaly 16).
+            assert_eq!(
+                reason,
+                expected_reason(code),
+                "shutdown failure code {code:#010X} was classified wrongly"
+            );
+            assert_eq!(
+                backend.get_vm(id).expect("get_vm").summary.state,
+                VmState::Running,
+                "a refused shutdown must leave the VM Running (anomaly 16)"
+            );
+            // Leave the host as it was found.
+            backend
+                .request_vm_state(id, RequestedState::TurnOff)
+                .expect("turn off");
+            wait_for_state(&mut backend, id, VmState::Off);
+            return;
+        }
+    }
+    wait_for_state(&mut backend, id, VmState::Off);
+}
+
+#[test]
+#[ignore = "requires a Windows host with Hyper-V"]
+fn guest_reboot_of_a_running_vm_resets_the_uptime() {
+    let _guard = mutation_lock();
+    let mut backend = must_connect(backend());
+    let id = must_find_test_vm(&mut backend);
+    assert_safe_vm(&mut backend, id);
+    // The shutdown component only exists while the VM is Running
+    // (design 3.7.4).
+    ensure_running(&mut backend, id);
+
+    let before = backend
+        .get_vm(id)
+        .expect("get_vm")
+        .summary
+        .uptime
+        .expect("a Running VM reports its uptime");
+    let pending = backend.request_guest_reboot(id).expect("reboot");
+    assert!(
+        matches!(pending, hypervctl_core::Pending::AwaitReboot { .. }),
+        "InitiateReboot has no job; completion is the uptime reset, got {pending:?}"
+    );
+    // Anomaly 17: the state stays Running, so the reset of the uptime is the
+    // only proof that the guest rebooted.
+    for _ in 0..120 {
+        let current = backend.get_vm(id).expect("get_vm").summary.uptime;
+        if current.is_some_and(|uptime| uptime < before) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    panic!("the guest did not reboot; uptime stayed at or above {before:?}");
 }
