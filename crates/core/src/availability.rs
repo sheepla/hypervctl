@@ -86,8 +86,11 @@ impl fmt::Display for Availability {
 
 /// The availability table of spec 2.9.
 ///
-/// Cells marked `*` in the specification (unverified on real hardware) are
-/// `Reject` until M11-V confirms them (design 3.3).
+/// The cells the specification once marked `*` (unverified on real hardware)
+/// follow M11-V: `stop --force`/Saved, `save`/Paused and
+/// `checkpoint restore`/Saved are `Ok`; `checkpoint restore`/Paused stays
+/// `Reject` (`ApplySnapshot` answers `32775`). See
+/// `docs/hypervctl-m11-findings.md`.
 pub fn availability(op: OpKind, state: VmState) -> Availability {
     use Availability::*;
     use OpKind::*;
@@ -109,17 +112,17 @@ pub fn availability(op: OpKind, state: VmState) -> Availability {
         (Stop, Running) => Ok,
         (Stop, Off) => Already,
 
-        // stop --force: OK from Running and Paused, already when Off.
-        // Saved is Reject (unverified `*`).
-        (StopForce, Running | Paused) => Ok,
+        // stop --force: OK from Running, Paused and Saved, already when Off
+        // (M11-V V1 confirmed TurnOff on a Saved VM).
+        (StopForce, Running | Paused | Saved) => Ok,
         (StopForce, Off) => Already,
 
         // restart / restart --force: OK only from Running.
         (Restart | RestartForce, Running) => Ok,
 
-        // save: OK from Running, already when Saved. Paused is Reject
-        // (unverified `*`).
-        (Save, Running) => Ok,
+        // save: OK from Running and Paused, already when Saved (M11-V V2
+        // confirmed Save on a Paused VM).
+        (Save, Running | Paused) => Ok,
         (Save, Saved) => Already,
 
         // pause: OK from Running, already when Paused.
@@ -133,9 +136,10 @@ pub fn availability(op: OpKind, state: VmState) -> Availability {
         // checkpoint create / remove: allowed in every stable state.
         (CheckpointCreate | CheckpointRemove, Running | Off | Saved | Paused) => Ok,
 
-        // checkpoint restore: only from Off. Saved and Paused are Reject
-        // (unverified `*`).
-        (CheckpointRestore, Off) => Ok,
+        // checkpoint restore: OK from Off and Saved (M11-V V3 confirmed
+        // ApplySnapshot succeeds from a Saved VM). Paused stays Reject: the
+        // provider answers `32775` there.
+        (CheckpointRestore, Off | Saved) => Ok,
 
         // Every other combination is Reject.
         _ => Reject,
@@ -184,10 +188,10 @@ mod tests {
             (Stop, Paused, Reject),
             (Stop, Busy, Wait),
             (Stop, Unknown(42), Reject),
-            // stop --force (Saved is Reject until M11-V confirms it)
+            // stop --force (M11-V V1: Saved is Ok)
             (StopForce, Running, Ok),
             (StopForce, Off, Already),
-            (StopForce, Saved, Reject),
+            (StopForce, Saved, Ok),
             (StopForce, Paused, Ok),
             (StopForce, Busy, Wait),
             (StopForce, Unknown(42), Reject),
@@ -205,11 +209,11 @@ mod tests {
             (RestartForce, Paused, Reject),
             (RestartForce, Busy, Wait),
             (RestartForce, Unknown(42), Reject),
-            // save (Paused is Reject until M11-V confirms it)
+            // save (M11-V V2: Paused is Ok)
             (Save, Running, Ok),
             (Save, Off, Reject),
             (Save, Saved, Already),
-            (Save, Paused, Reject),
+            (Save, Paused, Ok),
             (Save, Busy, Wait),
             (Save, Unknown(42), Reject),
             // pause
@@ -233,10 +237,10 @@ mod tests {
             (CheckpointCreate, Paused, Ok),
             (CheckpointCreate, Busy, Wait),
             (CheckpointCreate, Unknown(42), Reject),
-            // checkpoint restore (Saved/Paused are Reject until M11-V)
+            // checkpoint restore (M11-V V3: Saved is Ok, Paused stays Reject)
             (CheckpointRestore, Running, Reject),
             (CheckpointRestore, Off, Ok),
-            (CheckpointRestore, Saved, Reject),
+            (CheckpointRestore, Saved, Ok),
             (CheckpointRestore, Paused, Reject),
             (CheckpointRestore, Busy, Wait),
             (CheckpointRestore, Unknown(42), Reject),
@@ -269,7 +273,7 @@ mod tests {
         assert!(!states_where_ok(OpKind::CheckpointRestore).is_empty());
         assert_eq!(
             states_where_ok(OpKind::CheckpointRestore),
-            vec![VmState::Off]
+            vec![VmState::Off, VmState::Saved]
         );
     }
 

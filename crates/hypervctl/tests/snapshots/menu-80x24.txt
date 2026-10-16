@@ -10,10 +10,10 @@
 │ State          Save┌Actions · db-01─────────────────────┐                    │
 │ Generation     2   │ > Start                            │                    │
 │ Uptime         -   │   Stop                     Running │                    │
-│ CPU            -   │   Stop (force)      Running/Paused │                    │
+│ CPU            -   │   Stop (force)                     │                    │
 │                    │   Restart                  Running │                    │
 │ Processors     2   │   Restart (force)          Running │                    │
-│ Memory         2.0 │   Save                     Running │                    │
+│ Memory         2.0 │   Save              Running/Paused │                    │
 │                    │   Pause                    Running │                    │
 │ Services       -   │   Resume                    Paused │                    │
 │                    │   Create checkpoint                │                    │

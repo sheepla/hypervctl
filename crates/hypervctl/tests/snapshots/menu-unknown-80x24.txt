@@ -11,10 +11,10 @@
 │               │ VM state is unknown                          │               │
 │               │ > Start                     Off/Saved/Paused │               │
 │               │   Stop                               Running │               │
-│               │   Stop (force)                Running/Paused │               │
+│               │   Stop (force)          Running/Saved/Paused │               │
 │               │   Restart                            Running │               │
 │               │   Restart (force)                    Running │               │
-│               │   Save                               Running │               │
+│               │   Save                        Running/Paused │               │
 │               │   Pause                              Running │               │
 │               │   Resume                              Paused │               │
 │               │   Create checkpoint Running/Off/Saved/Paused │               │

@@ -1101,15 +1101,20 @@ impl HyperV for WmiBackend {
         checkpoint: CheckpointId,
         _name: &str,
     ) -> Result<Pending, HyperVError> {
-        // V4 (design 3.8.8) is unverified: which WMI method renames a
-        // checkpoint has not been confirmed on real hardware. Until M11-V
-        // verifies it, report a clear error rather than guessing (design
-        // 3.8: "推測で実装しない"). The operation layer already reports the
-        // created checkpoint's id so the user can clean up (design 3.3).
+        // M11-V V4 confirmed the mechanism: call `ModifySystemSettings` on
+        // `Msvm_VirtualSystemManagementService` with an embedded
+        // `Msvm_VirtualSystemSettingData` whose `ElementName` is the new name;
+        // it returns synchronously with ReturnValue=0 (no job). The call needs
+        // the VSSD serialized as embedded-instance text, which the backend
+        // does not build yet, so the implementation lands in M11-W2. Until
+        // then report a clear error rather than guessing (design 3.8:
+        // "推測で実装しない"). The operation layer already reports the created
+        // checkpoint's id so the user can clean up (design 3.3).
         let _ = checkpoint;
         Err(HyperVError::backend(RawError::new(
-            "checkpoint rename is not verified on real hardware yet (M11-V); \
-             the checkpoint was created with the provider's default name",
+            "checkpoint rename is not implemented yet (M11-W2); the method \
+             (ModifySystemSettings) is confirmed by M11-V V4, and the checkpoint \
+             was created with the provider's default name",
         )))
     }
 
@@ -1795,17 +1800,15 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_rename_reports_it_is_unverified() {
-        // Design 3.8: the rename method is confirmed by M11-V (V4) only;
-        // until then the backend reports clearly instead of guessing.
+    fn checkpoint_rename_waits_for_its_implementation() {
+        // M11-V V4 confirmed `ModifySystemSettings` renames a checkpoint; the
+        // call itself is implemented in M11-W2. Until then the backend reports
+        // clearly instead of guessing.
         let mut backend = WmiBackend::connect_or_unavailable();
         let error = backend
             .rename_checkpoint(CheckpointId::new(uuid::Uuid::nil()), "wanted")
-            .expect_err("rename waits for the M11-V result");
-        assert!(
-            error.to_string().contains("not verified on real hardware"),
-            "{error}"
-        );
+            .expect_err("rename waits for the M11-W2 implementation");
+        assert!(error.to_string().contains("not implemented yet"), "{error}");
     }
 
     #[test]

@@ -11,10 +11,10 @@
 │ Generation    │ VM is busy                                   │               │
 │ Uptime        │ > Start                     Off/Saved/Paused │               │
 │ CPU           │   Stop                               Running │               │
-│               │   Stop (force)                Running/Paused │               │
+│               │   Stop (force)          Running/Saved/Paused │               │
 │ Processors    │   Restart                            Running │               │
 │ Memory        │   Restart (force)                    Running │               │
-│               │   Save                               Running │               │
+│               │   Save                        Running/Paused │               │
 │ Services      │   Pause                              Running │               │
 │               │   Resume                              Paused │               │
 │ Checkpoints   │   Create checkpoint Running/Off/Saved/Paused │               │
