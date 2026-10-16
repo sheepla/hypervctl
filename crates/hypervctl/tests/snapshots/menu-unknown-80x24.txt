@@ -1,0 +1,24 @@
+┏VMs (4)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ NAME                            STATE          CPU     MEMORY       UPTIME   ┃
+┃   db-01                           Saved            -          -            - ┃
+┃ > ghost                           Unknown(42)      -          -            - ┃
+┃   web-01                          Running          -          -            - ┃
+┃   web-02                          Off              -          -            - ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+┌ghost · Unknown(42)───────────────────────────────────────────────────────────┐
+│ Details   Checkpoints                                                        │
+│ Loading...    ┌Actions · ghost───────────────────────────────┐               │
+│               │ VM state is unknown                          │               │
+│               │ > Start                     Off/Saved/Paused │               │
+│               │   Stop                               Running │               │
+│               │   Stop (force)                Running/Paused │               │
+│               │   Restart                            Running │               │
+│               │   Restart (force)                    Running │               │
+│               │   Save                               Running │               │
+│               │   Pause                              Running │               │
+│               │   Resume                              Paused │               │
+│               │   Create checkpoint Running/Off/Saved/Paused │               │
+│               └──────────────────────────────────────────────┘               │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+j/Down move  k/Up move  Enter run  Esc close

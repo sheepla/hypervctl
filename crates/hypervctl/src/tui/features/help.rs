@@ -2,16 +2,33 @@
 //! order the status bar shows the hints. Adding a row to the table is enough
 //! for it to appear here.
 
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::tui::keymap::{self, Context};
-use crate::tui::store::Focus;
+use crate::tui::store::{Focus, State};
+use crate::tui::ui::layout;
 
-/// Draws the help over the panes, if it is open.
-pub fn render(frame: &mut Frame, area: Rect, focus: Focus) {
+/// Draws the help over the whole terminal, if it is open. The scroll offset
+/// comes from the reducer (design 5.11).
+pub fn render(frame: &mut Frame, area: Rect, state: &State) {
+    let popup = layout::help_rect(area);
+    frame.render_widget(Clear, popup);
+    let block = Block::bordered().title("Help");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let lines = content_lines(state.focus);
+    let height = usize::from(inner.height);
+    let scroll = usize::from(state.help_scroll);
+    let visible: Vec<Line> = lines.iter().skip(scroll).take(height).cloned().collect();
+    frame.render_widget(Paragraph::new(visible), inner);
+}
+
+/// Every line the overlay holds, so the view and the scroll clamp see the
+/// same content (design 5.11).
+pub fn content_lines(focus: Focus) -> Vec<Line<'static>> {
     let mut lines = vec![Line::raw("Keys of the focused pane"), Line::raw("")];
     let pane = match focus {
         Focus::List => Context::List,
@@ -26,35 +43,13 @@ pub fn render(frame: &mut Frame, area: Rect, focus: Focus) {
     lines.push(Line::raw("Keys of the confirmation dialog"));
     lines.push(Line::raw(""));
     lines.extend(hint_lines(Context::Confirm));
-
-    let height = (lines.len() as u16 + 2)
-        .min(area.height.saturating_sub(2))
-        .max(3);
-    let width = 52u16.min(area.width.saturating_sub(2)).max(24);
-    let popup = centered(area, width, height);
-    frame.render_widget(Clear, popup);
-    let block = Block::bordered().title("Help");
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
-    frame.render_widget(Paragraph::new(lines), inner);
+    lines.push(Line::raw(""));
+    lines.push(Line::raw("Keys of the help"));
+    lines.push(Line::raw(""));
+    lines.extend(hint_lines(Context::Help));
+    lines
 }
 
 fn hint_lines(context: Context) -> Vec<Line<'static>> {
     keymap::hints(context).into_iter().map(Line::raw).collect()
-}
-
-fn centered(area: Rect, width: u16, height: u16) -> Rect {
-    let [_, vertical, _] = Layout::vertical([
-        Constraint::Fill(1),
-        Constraint::Length(height),
-        Constraint::Fill(1),
-    ])
-    .areas(area);
-    let [_, horizontal, _] = Layout::horizontal([
-        Constraint::Fill(1),
-        Constraint::Length(width),
-        Constraint::Fill(1),
-    ])
-    .areas(vertical);
-    horizontal
 }

@@ -1,8 +1,10 @@
 //! The action menu: which items a VM or a checkpoint offers and which of them
-//! can run right now (design 5.7, spec 3.4). Pure functions; the table tests
-//! are the specification table itself.
+//! can run right now (design 5.7, spec 3.4). Every decision comes from the one
+//! availability table of the core, so the menu and the CLI can never disagree
+//! (spec 2.9, anomaly 19). Pure functions; the table tests are the
+//! specification table itself.
 
-use hypervctl_core::{VmOp, VmState};
+use hypervctl_core::{availability, states_where_ok, Availability, OpKind, VmOp, VmState};
 
 /// One row of the VM menu, in the order the specification lists them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,8 +65,8 @@ impl VmMenuItem {
         matches!(self, Self::StopForce | Self::RestartForce)
     }
 
-    /// The operation behind the item. `Create checkpoint` is not a state
-    /// change and is dispatched by the reducer itself, so its arm is
+    /// The operation behind the item, as the runner executes it. `Create
+    /// checkpoint` is dispatched by the reducer itself, so its arm is
     /// unreachable and holds a harmless placeholder.
     pub const fn op(self) -> VmOp {
         match self {
@@ -79,6 +81,23 @@ impl VmMenuItem {
             // Never reached: menu_select dispatches CreateCheckpoint as an
             // OpRequest::CreateCheckpoint, not through op().
             Self::CreateCheckpoint => VmOp::Start,
+        }
+    }
+
+    /// The operation behind the item, as the availability table names it.
+    /// `Create checkpoint` is not a state change; it still has its own row
+    /// there, so the menu can derive from the same table (spec 2.9).
+    pub const fn op_kind(self) -> OpKind {
+        match self {
+            Self::Start => OpKind::Start,
+            Self::Stop => OpKind::Stop,
+            Self::StopForce => OpKind::StopForce,
+            Self::Restart => OpKind::Restart,
+            Self::RestartForce => OpKind::RestartForce,
+            Self::Save => OpKind::Save,
+            Self::Pause => OpKind::Pause,
+            Self::Resume => OpKind::Resume,
+            Self::CreateCheckpoint => OpKind::CheckpointCreate,
         }
     }
 }
@@ -96,28 +115,46 @@ impl CheckpointMenuItem {
     pub const fn needs_confirm(self) -> bool {
         true
     }
+
+    /// The operation behind the item, as the availability table names it.
+    pub const fn op_kind(self) -> OpKind {
+        match self {
+            Self::Restore => OpKind::CheckpointRestore,
+            Self::Remove => OpKind::CheckpointRemove,
+        }
+    }
 }
 
 /// Whether each VM menu item can run in `state` right now (spec 3.4, design
-/// 5.7): the table of the specification, with `Unknown` and an operation in
-/// flight disabling everything.
+/// 5.7): exactly the cells the availability table calls `Ok`, with an
+/// operation in flight disabling everything (anomaly 19: the menu is the
+/// table, nothing else).
 pub fn vm_item_enabled(item: VmMenuItem, state: VmState, op_in_flight: bool) -> bool {
-    if op_in_flight || matches!(state, VmState::Unknown(_)) {
+    !op_in_flight && availability(item.op_kind(), state) == Availability::Ok
+}
+
+/// Whether a checkpoint menu item can run: the same table, plus a checkpoint
+/// being selected at all (spec 3.4, anomaly 21).
+pub fn checkpoint_item_enabled(
+    item: CheckpointMenuItem,
+    state: Option<VmState>,
+    checkpoint_selected: bool,
+    op_in_flight: bool,
+) -> bool {
+    let Some(state) = state else {
         return false;
-    }
-    use VmMenuItem::*;
-    match item {
-        Start => matches!(state, VmState::Off | VmState::Saved | VmState::Paused),
-        Stop => state == VmState::Running,
-        StopForce => matches!(state, VmState::Running | VmState::Paused),
-        Restart | RestartForce => state == VmState::Running,
-        Save | Pause => state == VmState::Running,
-        Resume => state == VmState::Paused,
-        CreateCheckpoint => matches!(
-            state,
-            VmState::Running | VmState::Off | VmState::Saved | VmState::Paused
-        ),
-    }
+    };
+    !op_in_flight && checkpoint_selected && availability(item.op_kind(), state) == Availability::Ok
+}
+
+/// The states in which `item` can run, as the menu shows them next to a grey
+/// row (spec 3.4). Straight from the table; no second list exists (design 5.7).
+pub fn enabled_states_text(item_op: OpKind) -> String {
+    states_where_ok(item_op)
+        .into_iter()
+        .map(crate::cli::output::views::state_label)
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// The question a VM confirmation dialog asks (spec 3.4).

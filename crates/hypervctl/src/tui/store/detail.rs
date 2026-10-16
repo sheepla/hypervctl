@@ -26,14 +26,6 @@ impl DetailTab {
             Self::Checkpoints => Self::Details,
         }
     }
-
-    /// The index of the tab in the tab bar.
-    pub const fn index(self) -> usize {
-        match self {
-            Self::Details => 0,
-            Self::Checkpoints => 1,
-        }
-    }
 }
 
 /// The checkpoints of one VM, with the selection kept by id the same way the
@@ -86,9 +78,21 @@ impl CheckpointsState {
         }
         let current = self.selected_index().unwrap_or(self.last_index);
         let last = self.items.len() - 1;
-        let index = (current as isize + delta).clamp(0, last as isize) as usize;
+        let index = (current as isize)
+            .saturating_add(delta)
+            .clamp(0, last as isize) as usize;
         self.selected = self.items.get(index).map(|entry| entry.id);
         self.last_index = index;
+    }
+
+    /// Jumps to the first checkpoint (`g`, spec 3.3).
+    pub fn select_first(&mut self) {
+        self.move_by(isize::MIN);
+    }
+
+    /// Jumps to the last checkpoint (`G`, spec 3.3).
+    pub fn select_last(&mut self) {
+        self.move_by(isize::MAX);
     }
 
     /// The selected checkpoint, if any.

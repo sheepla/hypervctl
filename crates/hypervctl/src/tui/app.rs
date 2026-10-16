@@ -29,7 +29,11 @@ struct Loop {
 
 /// Runs the TUI until the user quits or the backend stops; the terminal is
 /// restored on every way out (design 5.10).
-pub async fn run(ops: &Operations, refresh: Duration) -> Result<CommandOutput, CliError> {
+pub async fn run(
+    ops: &Operations,
+    refresh: Duration,
+    mock: bool,
+) -> Result<CommandOutput, CliError> {
     // Step 3: the first list is read before the terminal is touched, so a
     // failing backend is just a CLI error (design 5.10).
     let items = ops.handle().list_vms().await?;
@@ -43,6 +47,8 @@ pub async fn run(ops: &Operations, refresh: Duration) -> Result<CommandOutput, C
         .size()
         .map_err(|error| io_error("reading the terminal size", error))?;
     let mut state = State::new(items, size.width, size.height);
+    // The list title says `[mock]` when the mock backend runs (spec 3.2).
+    state.ui.mock = mock;
 
     // Step 5: change notifications, keys and the timers.
     let (actions, mut incoming) = mpsc::unbounded_channel();

@@ -17,15 +17,17 @@ pub mod vm_list;
 use detail::DetailState;
 pub use detail::DetailTab;
 use menu::{
-    checkpoint_confirm_question, vm_confirm_question, vm_item_enabled, CheckpointMenuItem,
-    VmMenuItem, CHECKPOINT_MENU, VM_MENU,
+    checkpoint_confirm_question, checkpoint_item_enabled, vm_confirm_question, vm_item_enabled,
+    CheckpointMenuItem, VmMenuItem, CHECKPOINT_MENU, VM_MENU,
 };
 use ops_state::OpsState;
 pub use overlay::{ConfirmState, MenuKind, MenuState, OpRequest, Overlay};
 use status::{StatusKind, StatusState};
 use vm_list::VmListState;
 
+use crate::tui::features;
 use crate::tui::keymap;
+use crate::tui::ui::{layout, scroll};
 
 /// How long a success stays on the status bar before it fades (spec 3.5).
 const SUCCESS_LIFETIME: Duration = Duration::from_secs(3);
@@ -44,6 +46,16 @@ pub struct UiState {
     pub height: u16,
     /// Which spinner frame the operations in flight show (spec 3.5).
     pub spinner: usize,
+    /// The pane rectangles of spec 3.2, recomputed on every resize and every
+    /// list change; the view draws exactly what the scroll arithmetic used
+    /// (design 5.11).
+    pub layout: layout::Layout,
+    /// Whether the mock backend is running: the list title says `[mock]`
+    /// (spec 3.2).
+    pub mock: bool,
+    /// The clock the `UiTick` advances: ages like `stale 12s` are read from
+    /// here (spec 3.2).
+    pub now: Instant,
 }
 
 impl UiState {
@@ -74,6 +86,8 @@ pub struct State {
     pub overlay: Overlay,
     pub status: StatusState,
     pub ui: UiState,
+    /// How far the help overlay is scrolled (design 5.11).
+    pub help_scroll: u16,
     /// The backend actor stopped: the loop ends and the exit code is 1
     /// (design 5.5).
     pub fatal: Option<HyperVError>,
@@ -91,6 +105,7 @@ impl State {
             .items
             .sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
         vm_list.selected = vm_list.items.first().map(|vm| vm.id);
+        let vm_count = vm_list.items.len();
         Self {
             vm_list,
             focus: Focus::List,
@@ -108,7 +123,11 @@ impl State {
                 width,
                 height,
                 spinner: 0,
+                layout: layout::compute(width, height, vm_count),
+                mock: false,
+                now: Instant::now(),
             },
+            help_scroll: 0,
             fatal: None,
         }
     }
@@ -127,10 +146,11 @@ impl State {
         }
     }
 
-    /// Whether the `UiTick` has to run: while a message expires or an
-    /// operation spins (design 5.2, spec 3.5).
+    /// Whether the `UiTick` has to run: while a message expires, an
+    /// operation spins or the `stale 12s` age ticks (design 5.2, spec 3.2
+    /// and 3.5).
     pub fn needs_ui_tick(&self) -> bool {
-        self.status.needs_tick() || !self.ops.is_empty()
+        self.status.needs_tick() || !self.ops.is_empty() || self.vm_list.stale_since.is_some()
     }
 }
 
@@ -161,6 +181,8 @@ pub enum Action {
     TabPrev,
     ScrollUp,
     ScrollDown,
+    ScrollTop,
+    ScrollBottom,
     RefreshNow,
     OpenMenu,
     MenuUp,
@@ -242,20 +264,13 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
                 request_checkpoints(state, &mut effects);
             }
         }
-        Action::ScrollDown => {
-            if state.focus == Focus::Detail && state.detail.tab == DetailTab::Checkpoints {
-                state.detail.checkpoints.move_by(1);
-            } else {
-                state.detail.scroll = state.detail.scroll.saturating_add(1);
-            }
-        }
-        Action::ScrollUp => {
-            if state.focus == Focus::Detail && state.detail.tab == DetailTab::Checkpoints {
-                state.detail.checkpoints.move_by(-1);
-            } else {
-                state.detail.scroll = state.detail.scroll.saturating_sub(1);
-            }
-        }
+        Action::ScrollDown => scroll_by(state, 1),
+        Action::ScrollUp => scroll_by(state, -1),
+        // `g`/`G`: first and last (spec 3.3) — of the checkpoints when that
+        // list is up, of the help when it covers the panes, of the detail
+        // body else. Overshooting is clamped at the end of the reduction.
+        Action::ScrollTop => scroll_to_edge(state, false),
+        Action::ScrollBottom => scroll_to_edge(state, true),
         Action::RefreshNow => request_list_now(state, &mut effects),
         Action::OpenMenu => open_menu(state),
         Action::MenuUp => menu_move(state, -1),
@@ -270,7 +285,10 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
         Action::ToggleHelp => {
             state.overlay = match &state.overlay {
                 Overlay::Help => Overlay::None,
-                Overlay::None => Overlay::Help,
+                Overlay::None => {
+                    state.help_scroll = 0;
+                    Overlay::Help
+                }
                 // A menu or a dialog in front keeps its place (spec 3.3).
                 other => other.clone(),
             };
@@ -290,6 +308,7 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
         Action::Resize(width, height) => {
             state.ui.width = width;
             state.ui.height = height;
+            recompute_layout(state);
         }
         Action::RefreshTick => {
             // While a fetch is running, a tick starts nothing (design 5.5,
@@ -299,6 +318,7 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
             }
         }
         Action::UiTick(now) => {
+            state.ui.now = now;
             state.status.expire(now);
             state.ui.spinner = (state.ui.spinner + 1) % 4;
         }
@@ -321,6 +341,9 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
                     let overlay_name =
                         overlay_target.and_then(|target| state.vm_list.name_of(target));
                     let selection_vanished = state.vm_list.apply(items);
+                    // The count feeds the pane heights and the `rows a-b`
+                    // label (spec 3.2).
+                    recompute_layout(state);
                     if let Some(name) = &selection_vanished {
                         state.status.show(
                             StatusKind::Info,
@@ -344,8 +367,13 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
                     }
                 }
                 Err(error) if error.is_backend_stopped() => state.fatal = Some(error),
-                // Keep the last list on screen and warn (design 5.5).
-                Err(error) => state.vm_list.stale = Some(error.to_string()),
+                // Keep the last list on screen and warn (design 5.5). The
+                // age in the title starts now (spec 3.2).
+                Err(error) => {
+                    let now = state.ui.now;
+                    state.vm_list.stale = Some(error.to_string());
+                    state.vm_list.stale_since = Some(now);
+                }
             }
             if state.vm_list.refresh_again {
                 state.vm_list.refresh_again = false;
@@ -403,7 +431,83 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Effect> {
             request_list_now(state, &mut effects);
         }
     }
+    // Every action that can change a scroll target or a pane size ends with
+    // the same arithmetic the view uses: the selection stays visible, the
+    // detail and help scrolls stay inside their content (spec 3.3, design
+    // 5.11).
+    sync_scrolls(state);
     effects
+}
+
+/// The pane rectangles for the list that is actually loaded.
+fn recompute_layout(state: &mut State) {
+    state.ui.layout = layout::compute(state.ui.width, state.ui.height, state.vm_list.items.len());
+}
+
+/// The scroll motion of `ScrollUp`/`ScrollDown`: the help when it is up, the
+/// checkpoint list when that list is focused, the detail body else (spec 3.3).
+fn scroll_by(state: &mut State, delta: isize) {
+    if matches!(state.overlay, Overlay::Help) {
+        if delta > 0 {
+            state.help_scroll = state.help_scroll.saturating_add(1);
+        } else {
+            state.help_scroll = state.help_scroll.saturating_sub(1);
+        }
+        return;
+    }
+    if state.focus == Focus::Detail && state.detail.tab == DetailTab::Checkpoints {
+        state.detail.checkpoints.move_by(delta);
+        return;
+    }
+    if delta > 0 {
+        state.detail.scroll = state.detail.scroll.saturating_add(1);
+    } else {
+        state.detail.scroll = state.detail.scroll.saturating_sub(1);
+    }
+}
+
+/// The scroll motion of `g`/`G` (spec 3.3): jump to the far end of whichever
+/// scroll target is active. Overshooting is clamped by `sync_scrolls`.
+fn scroll_to_edge(state: &mut State, bottom: bool) {
+    if matches!(state.overlay, Overlay::Help) {
+        state.help_scroll = if bottom { u16::MAX } else { 0 };
+        return;
+    }
+    if state.focus == Focus::Detail && state.detail.tab == DetailTab::Checkpoints {
+        if bottom {
+            state.detail.checkpoints.select_last();
+        } else {
+            state.detail.checkpoints.select_first();
+        }
+        return;
+    }
+    state.detail.scroll = if bottom { u16::MAX } else { 0 };
+}
+
+/// Clamp every scroll target against what is on screen now (spec 3.3): the
+/// list keeps its selection visible, the detail and the help cannot scroll
+/// past their content.
+fn sync_scrolls(state: &mut State) {
+    let rows = state.vm_list.items.len();
+    let height = layout::list_body_height(state.ui.layout);
+    let index = state.vm_list.selected_index();
+    state.vm_list.offset = scroll::visible_range(index, state.vm_list.offset, height, rows);
+    let body_rows = features::detail::body_lines(state)
+        .len()
+        .min(u16::MAX as usize) as u16;
+    state.detail.scroll = scroll::clamp(
+        state.detail.scroll,
+        body_rows,
+        layout::detail_body_height(state.ui.layout),
+    );
+    let help_rows = features::help::content_lines(state.focus)
+        .len()
+        .min(u16::MAX as usize) as u16;
+    state.help_scroll = scroll::clamp(
+        state.help_scroll,
+        help_rows,
+        state.ui.height.saturating_sub(4),
+    );
 }
 
 /// The detail pane follows a selection that just moved (design 5.5).
@@ -456,7 +560,7 @@ fn open_menu(state: &mut State) {
                 vm,
                 kind: MenuKind::Checkpoint,
                 checkpoint: Some((entry.id, entry.name.clone())),
-                cursor: 0,
+                cursor: first_enabled_checkpoint_item(state, vm),
             });
             return;
         }
@@ -492,11 +596,37 @@ fn first_enabled_vm_item(state: &State, vm: VmId) -> usize {
         .unwrap_or(0)
 }
 
+/// The first checkpoint menu row that can run (spec 3.4), for the menu on the
+/// Checkpoints tab.
+fn first_enabled_checkpoint_item(state: &State, vm: VmId) -> usize {
+    let Some(vm_state) = vm_state_of(state, vm) else {
+        return 0;
+    };
+    let in_flight = state.ops.in_flight(vm);
+    CHECKPOINT_MENU
+        .iter()
+        .position(|item| checkpoint_item_enabled(*item, Some(vm_state), true, in_flight))
+        .unwrap_or(0)
+}
+
 /// The rows the cursor may stand on, given the current state (design 5.6:
 /// computed every frame, so a menu that stays open follows the state).
 fn enabled_menu_indices(state: &State, menu: &MenuState) -> Vec<usize> {
     match menu.kind {
-        MenuKind::Checkpoint => (0..CHECKPOINT_MENU.len()).collect(),
+        MenuKind::Checkpoint => {
+            let Some(vm_state) = vm_state_of(state, menu.vm) else {
+                return Vec::new();
+            };
+            let in_flight = state.ops.in_flight(menu.vm);
+            CHECKPOINT_MENU
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| {
+                    checkpoint_item_enabled(**item, Some(vm_state), true, in_flight)
+                })
+                .map(|(index, _)| index)
+                .collect()
+        }
         MenuKind::Vm => {
             let Some(vm_state) = vm_state_of(state, menu.vm) else {
                 return Vec::new();
@@ -564,6 +694,7 @@ fn menu_select(state: &mut State, effects: &mut Vec<Effect>) {
                 state.overlay = Overlay::Confirm(ConfirmState {
                     vm: menu.vm,
                     question: vm_confirm_question(item, &vm_name),
+                    note: None,
                     request: OpRequest::Vm {
                         vm: menu.vm,
                         vm_name: vm_name.clone(),
@@ -593,6 +724,14 @@ fn menu_select(state: &mut State, effects: &mut Vec<Effect>) {
             let Some((checkpoint, checkpoint_name)) = menu.checkpoint.clone() else {
                 return;
             };
+            // The row may have greyed out since the menu opened: the menu is
+            // the availability table (spec 3.4, anomaly 21).
+            let Some(vm_state) = vm_state_of(state, menu.vm) else {
+                return;
+            };
+            if !checkpoint_item_enabled(item, Some(vm_state), true, state.ops.in_flight(menu.vm)) {
+                return;
+            }
             let request = match item {
                 CheckpointMenuItem::Restore => OpRequest::RestoreCheckpoint {
                     vm: menu.vm,
@@ -611,6 +750,9 @@ fn menu_select(state: &mut State, effects: &mut Vec<Effect>) {
                 state.overlay = Overlay::Confirm(ConfirmState {
                     vm: menu.vm,
                     question: checkpoint_confirm_question(item, &vm_name, &checkpoint_name),
+                    // Restore warns about the changes that are lost (spec 3.4).
+                    note: (item == CheckpointMenuItem::Restore)
+                        .then(|| "Changes made since the checkpoint will be lost.".to_string()),
                     request,
                 });
                 return;

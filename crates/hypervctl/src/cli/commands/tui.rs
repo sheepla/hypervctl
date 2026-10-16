@@ -20,5 +20,5 @@ pub async fn run(
             "the tui needs an interactive terminal on stdin and stdout",
         ));
     }
-    crate::tui::app::run(ops, Duration::from_secs(refresh)).await
+    crate::tui::app::run(ops, Duration::from_secs(refresh), crate::backend_is_mock()).await
 }

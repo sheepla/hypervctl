@@ -2,6 +2,8 @@
 //! (design 5.3 and 5.6), and the flags that keep polling from piling up
 //! (design 5.5).
 
+use std::time::Instant;
+
 use hypervctl_core::{VmId, VmSummary};
 
 /// Everything the list pane knows (design 5.3).
@@ -21,6 +23,12 @@ pub struct VmListState {
     pub refresh_again: bool,
     /// The last refresh failed; the list on screen is out of date (design 5.5).
     pub stale: Option<String>,
+    /// When the last refresh failed, so the title can show `stale 12s`
+    /// (spec 3.2). Cleared with `stale`.
+    pub stale_since: Option<Instant>,
+    /// The first row on screen (spec 3.2). Kept by the reducer with the same
+    /// scroll arithmetic the view uses.
+    pub offset: usize,
 }
 
 impl VmListState {
@@ -41,6 +49,7 @@ impl VmListState {
         };
         self.items = items;
         self.stale = None;
+        self.stale_since = None;
         if self.selected.is_some() {
             if let Some(index) = self.selected_index() {
                 self.last_index = index;

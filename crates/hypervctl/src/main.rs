@@ -105,6 +105,28 @@ fn ensure_backend() -> Result<BackendChoice, CliError> {
     }
 }
 
+/// Whether the started backend is the mock, re-read from the environment with
+/// the same rule `ensure_backend` used (spec 3.2: the TUI title says
+/// `[mock]`). Unknown values were already rejected before the TUI starts.
+pub(crate) fn backend_is_mock() -> bool {
+    let value = std::env::var_os("HYPERVCTL_BACKEND")
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if value == "mock" {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        // Anything else was accepted as the WMI backend.
+        false
+    }
+    #[cfg(not(windows))]
+    {
+        // Non-Windows only ever reaches here with the mock.
+        true
+    }
+}
+
 /// `-v` writes debug logs, `-vv` trace logs, both to stderr (design 4.1).
 fn init_tracing(verbose: u8) {
     if verbose == 0 {

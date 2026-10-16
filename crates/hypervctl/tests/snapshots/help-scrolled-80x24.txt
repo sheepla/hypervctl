@@ -1,0 +1,24 @@
+┏VMs (4)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ NAME                            STATE          CPU     MEMORY       UPTIME   ┃
+┃ ┌Help──────────────────────────────────────────────────────────────────────┐ ┃
+┃ │Space menu                                                                │ ┃
+┃ │? help                                                                    │ ┃
+┃ │1 details tab                                                             │ ┃
+┗━│2 checkpoints tab                                                         │━┛
+┌d│j/Down move                                                               │─┐
+│ │k/Up move                                                                 │ │
+│ │g first                                                                   │ │
+│ │G last                                                                    │ │
+│ │Enter detail pane                                                         │ │
+│ │                                                                          │ │
+│ │Keys of the menu                                                          │ │
+│ │                                                                          │ │
+│ │j/Down move                                                               │ │
+│ │k/Up move                                                                 │ │
+│ │Enter run                                                                 │ │
+│ │Esc close                                                                 │ │
+│ │                                                                          │ │
+│ │Keys of the confirmation dialog                                           │ │
+│ └──────────────────────────────────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────────── lines 1-12 of 13 ┘
+j/Down scroll  k/Up scroll  g top  G bottom  ? close  Esc close  q/Ctrl+C quit

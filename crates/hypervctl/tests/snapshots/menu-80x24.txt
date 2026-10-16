@@ -1,24 +1,24 @@
-┌VMs───────────────────────────────────────────────────────────────────────────┐
-│> db-01                                   Saved            -         -  -     │
-│  ghost                                   Unknown(42)      -         -  -     │
-│  web-01                                  Running          -         -  -     │
-│  web-02                                  Off              -         -  -     │
-│                                                                              │
-│                                                                              │
-│               ┌Actions — db-01───────────────────────────────┐               │
-│               │Start                                         │               │
-│               │Stop                                          │               │
-└───────────────│Stop (force)                                  │───────────────┘
-┌───────────────│Restart                                       │───────────────┐
-│ 1 Details │ 2 │Restart (force)                               │               │
-│Name           │Save                                          │               │
-│Id             │Pause                                         │               │
-│State          │Resume                                        │               │
-│Generation     │Create checkpoint                             │               │
-│CPU            └──────────────────────────────────────────────┘               │
-│Uptime              -                                                         │
-│Processors          2                                                         │
-│Startup memory      2.0 GB                                                    │
-│Dynamic memory      enabled                                                   │
-└──────────────────────────────────────────────────────────────────────────────┘
+┏VMs (4)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ NAME                            STATE          CPU     MEMORY       UPTIME   ┃
+┃ > db-01                           Saved            -          -            - ┃
+┃   ghost                           Unknown(42)      -          -            - ┃
+┃   web-01                          Running          -          -            - ┃
+┃   web-02                          Off              -          -            - ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+┌db-01 · Saved─────────────────────────────────────────────────────────────────┐
+│ Details   Checkpoints                                                        │
+│ State          Save┌Actions · db-01─────────────────────┐                    │
+│ Generation     2   │ > Start                            │                    │
+│ Uptime         -   │   Stop                     Running │                    │
+│ CPU            -   │   Stop (force)      Running/Paused │                    │
+│                    │   Restart                  Running │                    │
+│ Processors     2   │   Restart (force)          Running │                    │
+│ Memory         2.0 │   Save                     Running │                    │
+│                    │   Pause                    Running │                    │
+│ Services       -   │   Resume                    Paused │                    │
+│                    │   Create checkpoint                │                    │
+│ Checkpoints    1   └────────────────────────────────────┘                    │
+│ Config         C:\ProgramData\Microsoft\Windows\Hyper-V\web-01.xml           │
+│ Notes          -                                                             │
+└──────────────────────────────────────────────────────────── lines 1-12 of 13 ┘
 j/Down move  k/Up move  Enter run  Esc close

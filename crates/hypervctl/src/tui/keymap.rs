@@ -134,6 +134,18 @@ const BINDINGS: &[Binding] = &[
     },
     Binding {
         contexts: DETAIL,
+        keys: &[(KeyCode::Char('g'), NONE)],
+        action: Action::ScrollTop,
+        description: "top",
+    },
+    Binding {
+        contexts: DETAIL,
+        keys: &[(KeyCode::Char('G'), NONE)],
+        action: Action::ScrollBottom,
+        description: "bottom",
+    },
+    Binding {
+        contexts: DETAIL,
         keys: &[(KeyCode::Esc, NONE)],
         action: Action::FocusList,
         description: "back to list",
@@ -169,6 +181,31 @@ const BINDINGS: &[Binding] = &[
         keys: &[(KeyCode::Char('y'), NONE)],
         action: Action::ConfirmYes,
         description: "confirm",
+    },
+    // The help scrolls before it does anything else (design 5.11: `j k g G`).
+    Binding {
+        contexts: HELP,
+        keys: &[(KeyCode::Char('j'), NONE), (KeyCode::Down, NONE)],
+        action: Action::ScrollDown,
+        description: "scroll",
+    },
+    Binding {
+        contexts: HELP,
+        keys: &[(KeyCode::Char('k'), NONE), (KeyCode::Up, NONE)],
+        action: Action::ScrollUp,
+        description: "scroll",
+    },
+    Binding {
+        contexts: HELP,
+        keys: &[(KeyCode::Char('g'), NONE)],
+        action: Action::ScrollTop,
+        description: "top",
+    },
+    Binding {
+        contexts: HELP,
+        keys: &[(KeyCode::Char('G'), NONE)],
+        action: Action::ScrollBottom,
+        description: "bottom",
     },
     Binding {
         contexts: HELP,
@@ -350,6 +387,15 @@ mod tests {
             action(Context::Detail, press(KeyCode::Char('k'))),
             Some(Action::ScrollUp)
         );
+        // `g`/`G` jump to the far end of the detail body (spec 3.3).
+        assert_eq!(
+            action(Context::Detail, press(KeyCode::Char('g'))),
+            Some(Action::ScrollTop)
+        );
+        assert_eq!(
+            action(Context::Detail, press(KeyCode::Char('G'))),
+            Some(Action::ScrollBottom)
+        );
         assert_eq!(
             action(Context::Detail, press(KeyCode::Esc)),
             Some(Action::FocusList)
@@ -396,7 +442,6 @@ mod tests {
     #[test]
     fn a_key_of_the_other_context_does_nothing() {
         assert_eq!(action(Context::List, press(KeyCode::Char('l'))), None);
-        assert_eq!(action(Context::Detail, press(KeyCode::Char('g'))), None);
         assert_eq!(action(Context::Detail, press(KeyCode::Enter)), None);
         assert_eq!(action(Context::List, press(KeyCode::Esc)), None);
     }
@@ -489,6 +534,15 @@ mod tests {
             action(Context::Help, press(KeyCode::Esc)),
             Some(Action::CloseOverlay)
         );
+        // The help scrolls with its own keys (design 5.11).
+        for (code, expected) in [
+            (KeyCode::Char('j'), Action::ScrollDown),
+            (KeyCode::Char('k'), Action::ScrollUp),
+            (KeyCode::Char('g'), Action::ScrollTop),
+            (KeyCode::Char('G'), Action::ScrollBottom),
+        ] {
+            assert_eq!(action(Context::Help, press(code)), Some(expected));
+        }
         let menu = hints(Context::Menu);
         assert!(
             menu.contains(&"Space menu".to_string()) || menu.contains(&"Enter run".to_string()),

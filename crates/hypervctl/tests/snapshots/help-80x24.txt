@@ -1,24 +1,24 @@
-┌VMs───────────────────────────────────────────────────────────────────────────┐
-│> db-01      ┌Help──────────────────────────────────────────────┐    -  -     │
-│  ghost      │Keys of the focused pane                          │    -  -     │
-│  web-01     │                                                  │    -  -     │
-│  web-02     │q/Ctrl+C quit                                     │    -  -     │
-│             │Tab focus                                         │             │
-│             │r refresh                                         │             │
-│             │Space menu                                        │             │
-│             │? help                                            │             │
-│             │1 details tab                                     │             │
-└─────────────│2 checkpoints tab                                 │─────────────┘
-┌─────────────│j/Down move                                       │─────────────┐
-│ 1 Details │ │k/Up move                                         │             │
-│Name         │g first                                           │             │
-│Id           │G last                                            │             │
-│State        │Enter detail pane                                 │             │
-│Generation   │                                                  │             │
-│CPU          │Keys of the menu                                  │             │
-│Uptime       │                                                  │             │
-│Processors   │j/Down move                                       │             │
-│Startup memor│k/Up move                                         │             │
-│Dynamic memor│Enter run                                         │             │
-└─────────────└──────────────────────────────────────────────────┘─────────────┘
-? close  Esc close  q/Ctrl+C quit
+┏VMs (4)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ NAME                            STATE          CPU     MEMORY       UPTIME   ┃
+┃ ┌Help──────────────────────────────────────────────────────────────────────┐ ┃
+┃ │Keys of the focused pane                                                  │ ┃
+┃ │                                                                          │ ┃
+┃ │q/Ctrl+C quit                                                             │ ┃
+┗━│Tab focus                                                                 │━┛
+┌d│r refresh                                                                 │─┐
+│ │Space menu                                                                │ │
+│ │? help                                                                    │ │
+│ │1 details tab                                                             │ │
+│ │2 checkpoints tab                                                         │ │
+│ │j/Down move                                                               │ │
+│ │k/Up move                                                                 │ │
+│ │g first                                                                   │ │
+│ │G last                                                                    │ │
+│ │Enter detail pane                                                         │ │
+│ │                                                                          │ │
+│ │Keys of the menu                                                          │ │
+│ │                                                                          │ │
+│ │j/Down move                                                               │ │
+│ └──────────────────────────────────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────────── lines 1-12 of 13 ┘
+j/Down scroll  k/Up scroll  g top  G bottom  ? close  Esc close  q/Ctrl+C quit

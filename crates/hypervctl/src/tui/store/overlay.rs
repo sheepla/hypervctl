@@ -68,6 +68,9 @@ pub struct ConfirmState {
     /// The VM the operation was confirmed for; it does not follow anything.
     pub vm: VmId,
     pub question: String,
+    /// The extra line under the question: `Restore` warns about the changes
+    /// that are lost (spec 3.4).
+    pub note: Option<String>,
     /// What runs when the user presses `y`.
     pub request: OpRequest,
 }
