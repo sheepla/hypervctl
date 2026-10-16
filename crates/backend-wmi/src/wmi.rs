@@ -6,7 +6,7 @@
 //! connection is created on the actor thread because WMI objects are not
 //! `Send` (design 3.2).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use hypervctl_core::{
@@ -33,6 +33,10 @@ pub struct WmiBackend {
     /// Counts WMI round-trips so tests can prove `list_vms` is not N+1.
     #[cfg(test)]
     query_count: u32,
+    /// Counts WMI method calls so tests can pin `list_vhds`' cost to the
+    /// formula in design 3.8.3 (M11-W2).
+    #[cfg(test)]
+    method_count: u32,
 }
 
 enum State {
@@ -123,10 +127,14 @@ struct JobRow {
 
 /// A row of `Msvm_StorageAllocationSettingData` (one virtual disk attachment).
 /// `InstanceID` is `Microsoft:{vm-guid}\{controller-guid}\{controller-num}\{address}\L`.
+/// `ResourceSubType` distinguishes a hard disk from a CD/DVD or floppy
+/// attachment (M11-W2).
 #[derive(Debug, Deserialize)]
 struct SdrdRow {
     #[serde(rename = "InstanceID")]
     instance_id: String,
+    #[serde(rename = "ResourceSubType")]
+    resource_sub_type: Option<String>,
     #[serde(rename = "HostResource")]
     host_resource: Option<Vec<String>>,
 }
@@ -184,11 +192,15 @@ impl WmiBackend {
                 state: State::Connected(con),
                 #[cfg(test)]
                 query_count: 0,
+                #[cfg(test)]
+                method_count: 0,
             },
             Err(error) => Self {
                 state: State::Unavailable(map_wmi_error(error)),
                 #[cfg(test)]
                 query_count: 0,
+                #[cfg(test)]
+                method_count: 0,
             },
         }
     }
@@ -214,6 +226,59 @@ impl WmiBackend {
             State::Connected(con) => Ok(con),
             State::Unavailable(error) => Err(error.clone()),
         }
+    }
+
+    /// [`exec_method_with`] plus a test-only call counter, so `wmi_round_trips`
+    /// can pin the cost of `list_vhds` (M11-W2).
+    fn exec_method_counted(
+        &mut self,
+        object_path: &str,
+        class_name: &str,
+        method_name: &str,
+        props: &[(&str, Variant)],
+    ) -> Result<IWbemClassWrapper, HyperVError> {
+        #[cfg(test)]
+        {
+            self.method_count += 1;
+        }
+        let con = self.connected()?;
+        exec_method_with(con, object_path, class_name, method_name, props)
+    }
+
+    /// Reads a VHD's metadata through `Msvm_ImageManagementService` (design
+    /// 3.8.3). Two calls per disk: the setting data (format, type, virtual and
+    /// block size, parent, disk id) and the state (file size). `None` when the
+    /// service cannot report the disk, e.g. the file is gone or the path is not
+    /// a virtual hard disk.
+    fn fetch_vhd_info(&mut self, path: &str) -> Option<VhdInfo> {
+        let host = host_name();
+        let service = image_management_service_path(&host);
+        let setting = match self.exec_method_counted(
+            &service,
+            "Msvm_ImageManagementService",
+            "GetVirtualHardDiskSettingData",
+            &[("Path", Variant::String(path.to_string()))],
+        ) {
+            Ok(out) => method_embedded_text(&out, "SettingData"),
+            Err(error) => {
+                tracing::debug!("GetVirtualHardDiskSettingData({path}) failed: {error}");
+                None
+            }
+        };
+        let setting = setting?;
+        let state = match self.exec_method_counted(
+            &service,
+            "Msvm_ImageManagementService",
+            "GetVirtualHardDiskState",
+            &[("Path", Variant::String(path.to_string()))],
+        ) {
+            Ok(out) => method_embedded_text(&out, "State"),
+            Err(error) => {
+                tracing::debug!("GetVirtualHardDiskState({path}) failed: {error}");
+                None
+            }
+        };
+        vhd_info_from_instances(path, &setting, state.as_deref())
     }
 
     fn summary_rows(&mut self) -> Result<Vec<SummaryRow>, HyperVError> {
@@ -471,6 +536,15 @@ fn snapshot_service_path(host: &str) -> String {
 fn management_service_path(host: &str) -> String {
     format!(
         "\\\\.\\{NAMESPACE}:Msvm_VirtualSystemManagementService.CreationClassName=\"Msvm_VirtualSystemManagementService\",Name=\"vmms\",SystemCreationClassName=\"Msvm_ComputerSystem\",SystemName=\"{host}\""
+    )
+}
+
+/// Builds the WMI object path for the image management service, the singleton
+/// that owns the VHD read methods (design 3.8.3). Four-key composite; unlike
+/// the management service its singleton `Name` is `vhdsvc` (M11-V).
+fn image_management_service_path(host: &str) -> String {
+    format!(
+        "\\\\.\\{NAMESPACE}:Msvm_ImageManagementService.CreationClassName=\"Msvm_ImageManagementService\",Name=\"vhdsvc\",SystemCreationClassName=\"Msvm_ComputerSystem\",SystemName=\"{host}\""
     )
 }
 
@@ -877,9 +951,17 @@ impl HyperV for WmiBackend {
                 });
             }
         }
-        // SDRD holds the VHD path in HostResource; DiskDrive does not.
-        let rows: Vec<SdrdRow> = self
-            .run_query("SELECT InstanceID, HostResource FROM Msvm_StorageAllocationSettingData")?;
+        // SDRD holds the VHD path in HostResource; DiskDrive does not. The
+        // class also carries the VM's CD/DVD and floppy attachments, so keep
+        // only the hard-disk rows (spec 2.5: `vhd list` lists VHDs only).
+        let rows: Vec<SdrdRow> = self.run_query(
+            "SELECT InstanceID, ResourceSubType, HostResource \
+             FROM Msvm_StorageAllocationSettingData",
+        )?;
+        let rows: Vec<SdrdRow> = rows
+            .into_iter()
+            .filter(|row| row.resource_sub_type.as_deref() == Some(HARD_DISK_SUBTYPE))
+            .collect();
         // Collect the controller GUIDs referenced by the SDRDs so we can look
         // up each controller's ResourceType once (IDE=5, SCSI=6, SATA=7).
         let mut controller_keys: Vec<String> = Vec::new();
@@ -942,7 +1024,7 @@ impl HyperV for WmiBackend {
                 .map_or(ControllerKind::Unknown(0), |rt| {
                     controller_kind_from_rasd(*rt)
                 });
-            let info = vhd_info_from_path(Path::new(&path));
+            let info = self.fetch_vhd_info(&path);
             attached.push(AttachedVhd {
                 attachment: VhdAttachment {
                     vm_id: VmId::new(vm_guid),
@@ -961,11 +1043,12 @@ impl HyperV for WmiBackend {
     }
 
     fn get_vhd(&mut self, path: &str) -> Result<VhdInfo, HyperVError> {
-        vhd_info_from_path(Path::new(path)).ok_or_else(|| HyperVError::NotFound {
-            kind: TargetKind::Vhd,
-            specified: path.to_string(),
-            raw: None,
-        })
+        self.fetch_vhd_info(path)
+            .ok_or_else(|| HyperVError::NotFound {
+                kind: TargetKind::Vhd,
+                specified: path.to_string(),
+                raw: None,
+            })
     }
 
     fn get_thumbnail(
@@ -1222,192 +1305,84 @@ impl HyperV for WmiBackend {
     }
 }
 
-/// Reads the file size and virtual size from the VHD/VHDX header. A missing
-/// or unreadable file yields `None` (design 3.1: information may be
-/// incomplete, the attachment itself still exists).
-fn vhd_info_from_path(path: &Path) -> Option<VhdInfo> {
-    let metadata = std::fs::metadata(path).ok()?;
-    let file_size_bytes = metadata.len();
-    let extension = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase());
-    let format = match extension.as_deref() {
-        Some("vhd") => VhdFormat::Vhd,
-        Some("vhdx") => VhdFormat::Vhdx,
-        _ => return None,
+/// The `ResourceSubType` of a virtual hard disk attachment; the CD/DVD and
+/// floppy attachments share the SDRD class but not this value (M11-W2).
+const HARD_DISK_SUBTYPE: &str = "Microsoft:Hyper-V:Virtual Hard Disk";
+
+/// Reads the embedded-instance text from a method out-param when the call
+/// succeeded. The provider returns `SettingData`/`State` as DTD text, and the
+/// property is absent (or a different shape) when it had nothing to report.
+fn method_embedded_text(out: &IWbemClassWrapper, property: &str) -> Option<String> {
+    if return_value(out).ok()? != 0 {
+        return None;
+    }
+    match out.get_property(property) {
+        Ok(Variant::String(text)) if !text.is_empty() => Some(text),
+        _ => None,
+    }
+}
+
+/// Extracts a property value from the DTD text of an embedded WMI instance,
+/// e.g. `<PROPERTY NAME="Format" TYPE="uint16"><VALUE>3</VALUE></PROPERTY>`.
+/// `None` when the property or its value is absent.
+fn embedded_property(text: &str, name: &str) -> Option<String> {
+    let open = format!("PROPERTY NAME=\"{name}\"");
+    let after_open = text.get(text.find(&open)?..)?;
+    let after_value = after_open.get(after_open.find("<VALUE>")? + "<VALUE>".len()..)?;
+    let value = after_value.get(..after_value.find("</VALUE>")?)?;
+    Some(unescape_xml(value))
+}
+
+/// Reverses the entity escapes Hyper-V uses in DTD text. Only the five
+/// predefined XML entities appear in practice; `&amp;` is expanded last so it
+/// cannot double-decode a literal `&lt;` (M11-W2).
+fn unescape_xml(value: &str) -> String {
+    value
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+/// Assembles a [`VhdInfo`] from the `Msvm_VirtualHardDiskSettingData` and
+/// `Msvm_VirtualHardDiskState` instances (design 3.8.3). The format, virtual
+/// size and file size are required; a disk the service could not describe
+/// fully yields `None` so the columns stay unknown rather than wrong.
+fn vhd_info_from_instances(path: &str, setting: &str, state: Option<&str>) -> Option<VhdInfo> {
+    let format = match embedded_property(setting, "Format")?.parse::<u16>() {
+        Ok(2) => VhdFormat::Vhd,
+        Ok(3) => VhdFormat::Vhdx,
+        Ok(other) => VhdFormat::Unknown(other),
+        Err(_) => return None,
     };
-    let virtual_size_bytes = match format {
-        VhdFormat::Vhd => read_vhd_virtual_size(path).unwrap_or(file_size_bytes),
-        VhdFormat::Vhdx => read_vhdx_virtual_size(path).unwrap_or(file_size_bytes),
-        VhdFormat::Unknown(_) => file_size_bytes,
+    let kind = match embedded_property(setting, "Type").and_then(|v| v.parse::<u16>().ok()) {
+        Some(2) => VhdKind::Fixed,
+        Some(3) => VhdKind::Dynamic,
+        Some(4) => VhdKind::Differencing,
+        Some(other) => VhdKind::Unknown(other),
+        None => VhdKind::Unknown(0),
     };
-    let (kind, parent_path) = match format {
-        VhdFormat::Vhd => read_vhd_footer(path)
-            .map(|f| (f.kind, f.parent_path))
-            .unwrap_or((VhdKind::Unknown(0), None)),
-        _ => (VhdKind::Unknown(0), None),
-    };
+    let virtual_size_bytes = embedded_property(setting, "MaxInternalSize")?
+        .parse::<u64>()
+        .ok()?;
+    let file_size_bytes = embedded_property(state?, "FileSize")?.parse::<u64>().ok()?;
+    let block_size_bytes =
+        embedded_property(setting, "BlockSize").and_then(|v| v.parse::<u64>().ok());
+    let parent_path = embedded_property(setting, "ParentPath")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let disk_id = embedded_property(setting, "VirtualDiskId").filter(|value| !value.is_empty());
     Some(VhdInfo {
-        path: path.to_path_buf(),
+        path: PathBuf::from(path),
         format,
         kind,
         virtual_size_bytes,
         file_size_bytes,
-        block_size_bytes: None,
+        block_size_bytes,
         parent_path,
-        disk_id: None,
+        disk_id,
     })
-}
-
-/// VHD footer fields we care about (512 bytes, big-endian numbers).
-struct VhdFooter {
-    kind: VhdKind,
-    virtual_size: u64,
-    parent_path: Option<PathBuf>,
-}
-
-/// Reads the VHD footer. Fixed disks store it at offset 0; dynamic and
-/// differencing disks at `file_size - 512`. Both locations are tried.
-fn read_vhd_footer(path: &Path) -> Option<VhdFooter> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut file = std::fs::File::open(path).ok()?;
-    let file_len = file.metadata().ok()?.len();
-    if file_len < 512 {
-        return None;
-    }
-    // Try the end first (dynamic/differencing), then the start (fixed).
-    let mut buf = [0u8; 512];
-    for offset in [file_len.wrapping_sub(512), 0] {
-        if file.seek(SeekFrom::Start(offset)).is_err() {
-            continue;
-        }
-        if file.read_exact(&mut buf).is_err() {
-            continue;
-        }
-        // Cookie at offset 0 must be "conectix".
-        if &buf[0..8] != b"conectix" {
-            continue;
-        }
-        let disk_type = u32::from_be_bytes([buf[60], buf[61], buf[62], buf[63]]);
-        let virtual_size = u64::from_be_bytes([
-            buf[48], buf[49], buf[50], buf[51], buf[52], buf[53], buf[54], buf[55],
-        ]);
-        let kind = match disk_type {
-            2 => VhdKind::Fixed,
-            3 => VhdKind::Dynamic,
-            4 => VhdKind::Differencing,
-            other => VhdKind::Unknown(other as u16),
-        };
-        // Parent locator for differencing disks (offset 64, 8 bytes BE).
-        let parent_path = if disk_type == 4 {
-            let plat_loc_off = u64::from_be_bytes([
-                buf[72], buf[73], buf[74], buf[75], buf[76], buf[77], buf[78], buf[79],
-            ]);
-            if plat_loc_off > 0 && plat_loc_off < file_len {
-                let _ = file.seek(SeekFrom::Start(plat_loc_off));
-                let mut pl = [0u8; 8];
-                if file.read_exact(&mut pl).is_ok() {
-                    let data_off = u64::from_be_bytes(pl) + 8; // skip header
-                    let data_len = u16::from_be_bytes([buf[64], buf[65]]) as u64;
-                    if data_off + data_len <= file_len && data_len > 0 && data_len < 2048 {
-                        let _ = file.seek(SeekFrom::Start(data_off));
-                        let mut raw = vec![0u8; data_len as usize];
-                        if file.read_exact(&mut raw).is_ok() {
-                            // UTF-16LE in practice; fall back to lossy.
-                            let s: String = raw
-                                .chunks(2)
-                                .map(|c| u16::from_le_bytes([c[0], *c.get(1).unwrap_or(&0)]))
-                                .filter_map(|u| char::from_u32(u32::from(u)))
-                                .collect();
-                            if !s.is_empty() {
-                                Some(PathBuf::from(s))
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        return Some(VhdFooter {
-            kind,
-            virtual_size,
-            parent_path,
-        });
-    }
-    None
-}
-
-fn read_vhd_virtual_size(path: &Path) -> Option<u64> {
-    read_vhd_footer(path).map(|f| f.virtual_size)
-}
-
-/// VHDX: "vhdxfile" signature at offset 0; VirtualSize lives in the metadata
-/// region (defined by the region table at 0x30000). The VirtualDiskSize item
-/// is at metadata offset 0x10008 (8 bytes LE) on standard Hyper-V VHDX files.
-fn read_vhdx_virtual_size(path: &Path) -> Option<u64> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut file = std::fs::File::open(path).ok()?;
-    let file_len = file.metadata().ok()?.len();
-    if file_len < 328 {
-        return None;
-    }
-    // Verify the file signature.
-    file.seek(SeekFrom::Start(0)).ok()?;
-    let mut sig = [0u8; 8];
-    file.read_exact(&mut sig).ok()?;
-    if &sig != b"vhdxfile" {
-        return None;
-    }
-    // The region table is at 0x30000 (after the two 64KB headers).
-    // It contains the metadata region offset.
-    file.seek(SeekFrom::Start(0x30000)).ok()?;
-    let mut region_hdr = [0u8; 16];
-    file.read_exact(&mut region_hdr).ok()?;
-    if &region_hdr[0..4] != b"regi" {
-        return None;
-    }
-    let entry_count =
-        u32::from_le_bytes([region_hdr[8], region_hdr[9], region_hdr[10], region_hdr[11]]);
-    // The metadata region GUID (file bytes): 06 a2 7c 8b 90 47 9a 4b b8 fe 57 5f 05 0f 88 6e
-    const META_GUID: [u8; 16] = [
-        0x06, 0xa2, 0x7c, 0x8b, 0x90, 0x47, 0x9a, 0x4b, 0xb8, 0xfe, 0x57, 0x5f, 0x05, 0x0f, 0x88,
-        0x6e,
-    ];
-    let mut meta_offset = None;
-    for e in 0..entry_count as u64 {
-        file.seek(SeekFrom::Start(0x30000 + 16 + e * 32)).ok()?;
-        let mut entry = [0u8; 32];
-        file.read_exact(&mut entry).ok()?;
-        if entry[0..16] == META_GUID {
-            meta_offset = Some(u64::from_le_bytes([
-                entry[16], entry[17], entry[18], entry[19], entry[20], entry[21], entry[22],
-                entry[23],
-            ]));
-            break;
-        }
-    }
-    let meta_base = meta_offset?;
-    // The VirtualDiskSize item is at metadata offset 0x10008 (8 bytes LE).
-    file.seek(SeekFrom::Start(meta_base + 0x10008)).ok()?;
-    let mut buf = [0u8; 8];
-    file.read_exact(&mut buf).ok()?;
-    let size = u64::from_le_bytes(buf);
-    if size == 0 {
-        return None;
-    }
-    Some(size)
 }
 
 /// One WMI event that maps onto a [`ChangeEvent`]. The struct names must equal
@@ -1619,6 +1594,116 @@ fn event_thread(kind: EventKind, tx: mpsc::UnboundedSender<ChangeEvent>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A captured `GetVirtualHardDiskSettingData` instance (M11-V V6),
+    /// re-indented but otherwise verbatim.
+    const DEBIAN_AVHDX_SETTING: &str = r#"<INSTANCE CLASSNAME="Msvm_VirtualHardDiskSettingData"><PROPERTY NAME="BlockSize" TYPE="uint32"><VALUE>2097152</VALUE></PROPERTY><PROPERTY NAME="ElementName" TYPE="string"><VALUE>Debian_65AE889E-3919-4C21-978B-545CDF734911.avhdx</VALUE></PROPERTY><PROPERTY NAME="Format" TYPE="uint16"><VALUE>3</VALUE></PROPERTY><PROPERTY NAME="InstanceID" TYPE="string"><VALUE>493C5843-CD5C-40E8-AED3-03D41B65464D</VALUE></PROPERTY><PROPERTY NAME="LogicalSectorSize" TYPE="uint32"><VALUE>512</VALUE></PROPERTY><PROPERTY NAME="MaxInternalSize" TYPE="uint64"><VALUE>136365211648</VALUE></PROPERTY><PROPERTY NAME="ParentPath" TYPE="string"><VALUE>C:\ProgramData\Microsoft\Windows\Virtual Hard Disks\Debian.vhdx</VALUE></PROPERTY><PROPERTY NAME="Path" TYPE="string"><VALUE>C:\ProgramData\Microsoft\Windows\Virtual Hard Disks\Debian_65AE889E-3919-4C21-978B-545CDF734911.avhdx</VALUE></PROPERTY><PROPERTY NAME="PhysicalSectorSize" TYPE="uint32"><VALUE>4096</VALUE></PROPERTY><PROPERTY NAME="Type" TYPE="uint16"><VALUE>4</VALUE></PROPERTY><PROPERTY NAME="VirtualDiskId" TYPE="string"><VALUE>1B2472B2-FDCF-48AD-BCAD-B6A85B36FBC4</VALUE></PROPERTY></INSTANCE>"#;
+
+    /// The matching `GetVirtualHardDiskState` instance (M11-V V6).
+    const DEBIAN_AVHDX_STATE: &str = r#"<INSTANCE CLASSNAME="Msvm_VirtualHardDiskState"><PROPERTY NAME="Alignment" TYPE="uint32"><VALUE>1</VALUE></PROPERTY><PROPERTY NAME="FileSize" TYPE="uint64"><VALUE>126877696</VALUE></PROPERTY><PROPERTY NAME="InUse" TYPE="boolean"><VALUE>TRUE</VALUE></PROPERTY><PROPERTY NAME="MinInternalSize" TYPE="uint64"><VALUE>136365211648</VALUE></PROPERTY><PROPERTY NAME="PhysicalSectorSize" TYPE="uint32"><VALUE>4096</VALUE></PROPERTY></INSTANCE>"#;
+
+    #[test]
+    fn embedded_property_reads_dtd_values_and_stops_at_the_name() {
+        // `Path` must not be confused with `ParentPath`.
+        assert_eq!(
+            embedded_property(DEBIAN_AVHDX_SETTING, "Path").as_deref(),
+            Some(
+                r"C:\ProgramData\Microsoft\Windows\Virtual Hard Disks\Debian_65AE889E-3919-4C21-978B-545CDF734911.avhdx"
+            )
+        );
+        assert_eq!(
+            embedded_property(DEBIAN_AVHDX_SETTING, "ParentPath").as_deref(),
+            Some(r"C:\ProgramData\Microsoft\Windows\Virtual Hard Disks\Debian.vhdx")
+        );
+        assert_eq!(
+            embedded_property(DEBIAN_AVHDX_SETTING, "Format").as_deref(),
+            Some("3")
+        );
+        // A missing property is `None`, never a panic.
+        assert_eq!(embedded_property(DEBIAN_AVHDX_SETTING, "Nope"), None);
+    }
+
+    #[test]
+    fn embedded_property_decodes_entity_escapes() {
+        let text = r#"<PROPERTY NAME="Path" TYPE="string"><VALUE>C:\a&amp;b&lt;c&gt;.vhdx</VALUE></PROPERTY>"#;
+        assert_eq!(
+            embedded_property(text, "Path").as_deref(),
+            Some(r"C:\a&b<c>.vhdx")
+        );
+    }
+
+    #[test]
+    fn vhd_info_maps_the_setting_and_state_fields() {
+        let info = vhd_info_from_instances(
+            r"C:\disk.avhdx",
+            DEBIAN_AVHDX_SETTING,
+            Some(DEBIAN_AVHDX_STATE),
+        )
+        .expect("info");
+        assert_eq!(info.path, PathBuf::from(r"C:\disk.avhdx"));
+        assert_eq!(info.format, VhdFormat::Vhdx);
+        assert_eq!(info.kind, VhdKind::Differencing);
+        assert_eq!(info.virtual_size_bytes, 136_365_211_648);
+        assert_eq!(info.file_size_bytes, 126_877_696);
+        assert_eq!(info.block_size_bytes, Some(2_097_152));
+        assert_eq!(
+            info.parent_path,
+            Some(PathBuf::from(
+                r"C:\ProgramData\Microsoft\Windows\Virtual Hard Disks\Debian.vhdx"
+            ))
+        );
+        assert_eq!(
+            info.disk_id.as_deref(),
+            Some("1B2472B2-FDCF-48AD-BCAD-B6A85B36FBC4")
+        );
+    }
+
+    #[test]
+    fn vhd_info_keeps_unknown_format_and_kind_values() {
+        let setting = r#"<INSTANCE CLASSNAME="Msvm_VirtualHardDiskSettingData"><PROPERTY NAME="Format" TYPE="uint16"><VALUE>9</VALUE></PROPERTY><PROPERTY NAME="Type" TYPE="uint16"><VALUE>7</VALUE></PROPERTY><PROPERTY NAME="MaxInternalSize" TYPE="uint64"><VALUE>1024</VALUE></PROPERTY></INSTANCE>"#;
+        let state = r#"<INSTANCE CLASSNAME="Msvm_VirtualHardDiskState"><PROPERTY NAME="FileSize" TYPE="uint64"><VALUE>512</VALUE></PROPERTY></INSTANCE>"#;
+        let info = vhd_info_from_instances(r"C:\disk.vhdx", setting, Some(state)).expect("info");
+        assert_eq!(info.format, VhdFormat::Unknown(9));
+        assert_eq!(info.kind, VhdKind::Unknown(7));
+        assert_eq!(info.block_size_bytes, None);
+        assert_eq!(info.parent_path, None);
+        assert_eq!(info.disk_id, None);
+    }
+
+    #[test]
+    fn vhd_info_is_none_without_the_required_fields() {
+        // No format.
+        assert!(vhd_info_from_instances(
+            "x",
+            r#"<INSTANCE CLASSNAME="Msvm_VirtualHardDiskSettingData"><PROPERTY NAME="MaxInternalSize"><VALUE>1</VALUE></PROPERTY></INSTANCE>"#,
+            Some(r#"<INSTANCE CLASSNAME="Msvm_VirtualHardDiskState"><PROPERTY NAME="FileSize"><VALUE>1</VALUE></PROPERTY></INSTANCE>"#),
+        )
+        .is_none());
+        // No state instance at all.
+        assert!(vhd_info_from_instances("x", DEBIAN_AVHDX_SETTING, None).is_none());
+    }
+
+    #[test]
+    #[ignore = "probe: real machine only"]
+    fn wmi_round_trips_of_list_vhds_stay_constant_plus_per_disk() {
+        let mut backend = WmiBackend::connect_or_unavailable();
+        // Prove the connection opened, then reset the counters.
+        backend.list_vms().expect("list_vms");
+        backend.query_count = 0;
+        backend.method_count = 0;
+        let attached = backend.list_vhds(None).expect("list_vhds");
+        // Two bulk queries: the attachment walk and the controller lookup.
+        assert_eq!(backend.query_count, 2, "list_vhds must not query per VM");
+        // One or two ImageManagementService calls per attached disk (design
+        // 3.8.3: the state call is skipped when the setting data failed).
+        let disks = attached.len() as u32;
+        assert!(
+            backend.method_count >= disks && backend.method_count <= 2 * disks,
+            "{} method calls for {} disks",
+            backend.method_count,
+            disks
+        );
+    }
 
     fn summary_row(
         name: &str,
@@ -1889,8 +1974,10 @@ mod tests {
     }
 
     #[test]
-    fn vhd_info_needs_the_file_to_exist() {
-        let missing = vhd_info_from_path(Path::new(r"C:\definitely\missing\disk.vhdx"));
-        assert_eq!(missing, None);
+    fn the_image_management_service_singleton_is_named_vhdsvc() {
+        let path = image_management_service_path("HOST");
+        assert!(path.contains(r#"CreationClassName="Msvm_ImageManagementService""#));
+        assert!(path.contains(r#"Name="vhdsvc""#));
+        assert!(path.contains(r#"SystemName="HOST""#));
     }
 }

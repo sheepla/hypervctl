@@ -14,7 +14,8 @@
 
 use hypervctl_backend_wmi::WmiBackend;
 use hypervctl_core::{
-    HyperV, HyperVError, JobFailReason, RequestedState, TargetKind, VmId, VmState,
+    HyperV, HyperVError, JobFailReason, RequestedState, TargetKind, VhdFormat, VhdKind, VmId,
+    VmState,
 };
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
@@ -217,6 +218,90 @@ fn vhd_info_reports_virtual_size_larger_than_or_equal_to_file_size() {
             info.path
         );
     }
+}
+
+/// `vhd list` must list only virtual hard disks (spec 2.5), and every disk's
+/// metadata must come from `Msvm_ImageManagementService` (design 3.8.3), never
+/// from reading the host file. M11-W2 acceptance 22.
+#[test]
+#[ignore = "requires a Windows host with Hyper-V"]
+fn list_vhds_reads_image_management_fields_for_every_disk() {
+    let mut backend = must_connect(backend());
+    let all = backend.list_vhds(None).expect("list_vhds");
+    assert!(
+        !all.is_empty(),
+        "the host has no attached VHDs; create a VM with a disk first"
+    );
+    for attached in &all {
+        let path = attached
+            .attachment
+            .path
+            .to_string_lossy()
+            .to_ascii_lowercase();
+        // CD/DVD and floppy attachments share the SDRD class but must not be
+        // listed as virtual hard disks.
+        assert!(
+            !path.ends_with(".iso") && !path.ends_with(".vfd"),
+            "non-disk attachment was listed: {path}"
+        );
+        let info = attached
+            .info
+            .as_ref()
+            .unwrap_or_else(|| panic!("no image-management info for {path}"));
+        // The format follows the file extension.
+        let expected = if path.ends_with(".vhd") {
+            VhdFormat::Vhd
+        } else {
+            VhdFormat::Vhdx
+        };
+        assert_eq!(info.format, expected, "format for {path}");
+        // A real disk reports its allocation type and identity.
+        assert_ne!(info.kind, VhdKind::Unknown(0), "kind for {path}");
+        assert!(info.disk_id.is_some(), "disk id for {path}");
+        assert!(
+            info.virtual_size_bytes >= info.file_size_bytes,
+            "virtual size {} < file size {} for {path}",
+            info.virtual_size_bytes,
+            info.file_size_bytes
+        );
+    }
+}
+
+/// `get_vhd` reads the same metadata as the list for an attached disk, and a
+/// path that is not a virtual hard disk is `NotFound` (spec 2.5).
+#[test]
+#[ignore = "requires a Windows host with Hyper-V"]
+fn get_vhd_matches_the_attachment_list_entry() {
+    let mut backend = must_connect(backend());
+    let all = backend.list_vhds(None).expect("list_vhds");
+    let first = all.first().expect("at least one attached VHD");
+    let path = first.attachment.path.to_string_lossy().into_owned();
+    let info = backend.get_vhd(&path).expect("get_vhd");
+    let listed = first.info.clone().expect("list info");
+    // Compare the stable fields: `file_size_bytes` grows while a disk is in
+    // use, so it can differ between the two calls.
+    assert_eq!(info.path, listed.path);
+    assert_eq!(info.format, listed.format);
+    assert_eq!(info.kind, listed.kind);
+    assert_eq!(info.virtual_size_bytes, listed.virtual_size_bytes);
+    assert_eq!(info.block_size_bytes, listed.block_size_bytes);
+    assert_eq!(info.parent_path, listed.parent_path);
+    assert_eq!(info.disk_id, listed.disk_id);
+
+    // A path with no virtual hard disk behind it is not found.
+    let error = backend
+        .get_vhd(r"C:\definitely\missing\disk.vhdx")
+        .expect_err("must fail");
+    assert!(
+        matches!(
+            error,
+            HyperVError::NotFound {
+                kind: TargetKind::Vhd,
+                ..
+            } | HyperVError::Backend { .. }
+        ),
+        "expected NotFound or Backend, got: {error}"
+    );
 }
 
 /// Waits until `id` reaches `goal`, or fails with the last observed state.
