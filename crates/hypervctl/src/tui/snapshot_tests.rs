@@ -319,6 +319,45 @@ fn a_vm_with_an_operation_shows_a_spinner() {
     compare("spinner-80x24", &rows);
 }
 
+/// Anomaly 33: the spinner replaces the selection marker, so a busy row differs
+/// from the same row without an operation only in the marker column.
+#[test]
+fn a_spinner_does_not_move_the_other_columns() {
+    let plain = sample_state(80, 24);
+    let mut busy = sample_state(80, 24);
+    let selected = busy
+        .vm_list
+        .selected
+        .unwrap_or_else(|| unreachable!("a VM is always selected in the sample"));
+    busy.ops.start(selected, "stopping".to_string());
+
+    let plain_rows = frame(&plain, 80, 24);
+    let busy_rows = frame(&busy, 80, 24);
+    // The status bar carries the operation and is expected to differ; every
+    // other row may only differ where the marker column sits.
+    let mut shifted = 0;
+    let compared = busy_rows.len().saturating_sub(1);
+    for (busy_row, plain_row) in busy_rows.iter().zip(&plain_rows).take(compared) {
+        let busy_chars: Vec<char> = busy_row.chars().collect();
+        let plain_chars: Vec<char> = plain_row.chars().collect();
+        assert_eq!(
+            busy_chars.len(),
+            plain_chars.len(),
+            "{busy_row:?} vs {plain_row:?}"
+        );
+        for (column, (busy_cell, plain_cell)) in busy_chars.iter().zip(&plain_chars).enumerate() {
+            if busy_cell != plain_cell {
+                assert_eq!(
+                    column, 2,
+                    "column {column} moved: {busy_row:?} vs {plain_row:?}"
+                );
+                shifted += 1;
+            }
+        }
+    }
+    assert_eq!(shifted, 1, "only the marker column may change");
+}
+
 /// The detail pane gets the thick frame when it has the focus (spec 3.2).
 #[test]
 fn the_focused_pane_gets_a_thick_frame() {

@@ -83,6 +83,12 @@ pub struct MockBackend {
     /// The next guest shutdown fails the way a guest without integration
     /// services does (design 3.5).
     guest_not_ready: bool,
+    /// The next `rename_checkpoint` fails even though the checkpoint exists
+    /// (design 3.3 step 4, anomaly 20).
+    rename_failure: Option<HyperVError>,
+    /// How many checkpoints one `create_checkpoint` adds. Anything but one
+    /// leaves the created checkpoint ambiguous (design 3.3 step 3, anomaly 20).
+    checkpoints_per_create: usize,
 }
 
 impl Default for MockBackend {
@@ -114,6 +120,8 @@ impl MockBackend {
             injected_delay: None,
             failing_jobs: HashMap::new(),
             guest_not_ready: false,
+            rename_failure: None,
+            checkpoints_per_create: 1,
         }
     }
 
@@ -150,6 +158,18 @@ impl MockBackend {
     /// (`0x800710DF`) and the VM stays Running (design 3.5, anomaly 16).
     pub fn inject_guest_not_ready(&mut self) {
         self.guest_not_ready = true;
+    }
+
+    /// The next `rename_checkpoint` fails although the checkpoint exists, so
+    /// the operation layer must still report the created id (anomaly 20).
+    pub fn inject_rename_failure(&mut self, error: HyperVError) {
+        self.rename_failure = Some(error);
+    }
+
+    /// Makes one `create_checkpoint` add `count` checkpoints. A count other
+    /// than one leaves the created checkpoint ambiguous (anomaly 20).
+    pub fn create_checkpoints_per_call(&mut self, count: usize) {
+        self.checkpoints_per_create = count;
     }
 
     /// Keeps every job Running for its first polls queries, whatever the
@@ -465,25 +485,28 @@ impl HyperV for MockBackend {
     fn create_checkpoint(&mut self, vm: VmId) -> Result<Pending, HyperVError> {
         self.begin()?;
         self.vm_mut(vm)?;
-        let id = self.next_checkpoint_id();
-        let name = format!("Checkpoint {}", self.next_checkpoint);
-        let parent = self
-            .checkpoints
-            .iter()
-            .rfind(|entry| entry.vm == vm)
-            .map(|entry| entry.data.id);
-        self.checkpoints.push(CheckpointEntry {
-            vm,
-            data: Checkpoint {
-                id,
-                name,
-                kind: CheckpointKind::Standard,
-                created: Some(std::time::SystemTime::now()),
-                parent_id: parent,
-            },
-        });
+        let count = self.checkpoints_per_create;
+        for _ in 0..count {
+            let id = self.next_checkpoint_id();
+            let name = format!("Checkpoint {}", self.next_checkpoint);
+            let parent = self
+                .checkpoints
+                .iter()
+                .rfind(|entry| entry.vm == vm)
+                .map(|entry| entry.data.id);
+            self.checkpoints.push(CheckpointEntry {
+                vm,
+                data: Checkpoint {
+                    id,
+                    name,
+                    kind: CheckpointKind::Standard,
+                    created: Some(std::time::SystemTime::now()),
+                    parent_id: parent,
+                },
+            });
+        }
         if let Ok(vm) = self.vm_mut(vm) {
-            vm.checkpoint_count += 1;
+            vm.checkpoint_count += count as u32;
         }
         self.announce(ChangeEvent::Checkpoints(vm));
         Ok(Pending::Job(self.new_job(vm)))
@@ -495,6 +518,9 @@ impl HyperV for MockBackend {
         name: &str,
     ) -> Result<Pending, HyperVError> {
         self.begin()?;
+        if let Some(error) = self.rename_failure.take() {
+            return Err(error);
+        }
         let entry = self
             .checkpoints
             .iter_mut()

@@ -8,7 +8,7 @@ use std::time::Duration;
 use hypervctl_backend_mock::{MockBackend, TickMode};
 use hypervctl_core::{
     BackendActor, HyperVError, JobFailReason, JobRef, JobStatus, OpOutcome, OpSuccess, Operations,
-    Pending, Phase, Progress, TargetKind, VmOp, VmState, WaitPolicy,
+    Pending, Phase, Progress, RawError, TargetKind, VmOp, VmState, WaitPolicy,
 };
 
 fn specs(names: &[&str]) -> Vec<String> {
@@ -467,6 +467,61 @@ async fn checkpoints_are_created_renamed_and_removed() {
         .result;
     assert!(matches!(removed, Ok(OpSuccess::Completed { .. })));
     assert!(ok(ops.handle().list_checkpoints(vm).await).is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_rename_still_reports_the_created_checkpoint() {
+    // Anomaly 20: the checkpoint exists but could not be named, so the
+    // operation layer must report its id and original name for cleanup
+    // (design 3.3 step 4).
+    let mut backend = fixture();
+    backend.inject_rename_failure(HyperVError::backend(RawError::new("rename refused")));
+    let ops = operations(backend).await;
+    let vm = ok(ops.resolve_vm("web-02").await);
+
+    let outcome = ops
+        .create_checkpoint(
+            "web-02",
+            Some("wanted"),
+            WaitPolicy::Wait(Some(Duration::from_secs(30))),
+            &mut no_progress,
+        )
+        .await;
+    let (id, name) = match outcome.created {
+        Some(pair) => pair,
+        None => panic!("the created checkpoint must still be reported"),
+    };
+    assert_eq!(name, "Checkpoint 1");
+    assert!(outcome.result.is_err());
+
+    let listed = ok(ops.handle().list_checkpoints(vm).await);
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, id);
+    assert_eq!(listed[0].name, "Checkpoint 1");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_create_that_yields_no_single_checkpoint_is_refused() {
+    // Anomaly 20: when the id difference is not exactly one, the operation
+    // layer must not guess which checkpoint was created (design 3.3 step 3).
+    let mut backend = fixture();
+    backend.create_checkpoints_per_call(2);
+    let ops = operations(backend).await;
+
+    let outcome = ops
+        .create_checkpoint(
+            "web-02",
+            Some("wanted"),
+            WaitPolicy::Wait(Some(Duration::from_secs(30))),
+            &mut no_progress,
+        )
+        .await;
+    assert!(outcome.created.is_none());
+    match outcome.result {
+        Err(HyperVError::Backend { .. }) => {}
+        Err(other) => panic!("expected a backend error, got {other:?}"),
+        Ok(success) => panic!("expected a failure, got {success:?}"),
+    }
 }
 
 #[tokio::test(start_paused = true)]
