@@ -565,16 +565,44 @@ fn shutdown_component_path(host: &str, vm: VmId) -> String {
 }
 
 /// Builds the WMI object path for a VSSD instance (M0 item 6: `InstanceID` is
-/// the sole key of `Msvm_VirtualSystemSettingData`).
+/// the sole key of `Msvm_VirtualSystemSettingData`; adding `CreationClassName`
+/// makes the path invalid with `WBEM_E_INVALID_OBJECT_PATH`).
 fn vssd_object_path(instance_id: &str) -> String {
-    format!(
-        "\\\\.\\{NAMESPACE}:Msvm_VirtualSystemSettingData.CreationClassName=\"Msvm_VirtualSystemSettingData\",InstanceID=\"{instance_id}\""
-    )
+    format!("\\\\.\\{NAMESPACE}:Msvm_VirtualSystemSettingData.InstanceID=\"{instance_id}\"")
 }
 
 /// `InstanceID` of the VSSD behind a checkpoint id (`Microsoft:<guid>`).
 fn vssd_instance_id(checkpoint: CheckpointId) -> String {
     format!("Microsoft:{checkpoint}")
+}
+
+/// Serializes a WMI instance to the DTD text `ModifySystemSettings` expects
+/// (design 3.3, M11-V V4). `IWbemObjectTextSrc` is the only serializer the
+/// provider accepts; building the text by hand is not (the checkpoint's VSSD
+/// carries propagated properties and arrays).
+fn vssd_to_dtd_text(vssd: &IWbemClassWrapper) -> Result<String, HyperVError> {
+    use windows::core::GUID;
+    use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+    use windows::Win32::System::Wmi::{IWbemObjectTextSrc, WMI_OBJ_TEXT_WMI_DTD_2_0};
+
+    // `WbemObjectTextSrc` is not exported as a named constant by the `windows`
+    // crate; this is its CLSID.
+    const CLSID_WBEM_OBJECT_TEXT_SRC: GUID =
+        GUID::from_u128(0x8d1c559d_84f0_4bb3_a7d5_56a7435a9ba6);
+    let source: IWbemObjectTextSrc =
+        unsafe { CoCreateInstance(&CLSID_WBEM_OBJECT_TEXT_SRC, None, CLSCTX_INPROC_SERVER) }
+            .map_err(|error| {
+                HyperVError::backend(RawError::new(format!(
+                    "CoCreateInstance(WbemObjectTextSrc) failed: {error}"
+                )))
+            })?;
+    let text = unsafe { source.GetText(0, &vssd.inner, WMI_OBJ_TEXT_WMI_DTD_2_0.0 as u32, None) }
+        .map_err(|error| {
+        HyperVError::backend(RawError::new(format!(
+            "WbemObjectTextSrc.GetText failed: {error}"
+        )))
+    })?;
+    Ok(text.to_string())
 }
 
 /// The host name Hyper-V uses as `SystemName` on service objects.
@@ -1182,23 +1210,33 @@ impl HyperV for WmiBackend {
     fn rename_checkpoint(
         &mut self,
         checkpoint: CheckpointId,
-        _name: &str,
+        name: &str,
     ) -> Result<Pending, HyperVError> {
-        // M11-V V4 confirmed the mechanism: call `ModifySystemSettings` on
-        // `Msvm_VirtualSystemManagementService` with an embedded
-        // `Msvm_VirtualSystemSettingData` whose `ElementName` is the new name;
-        // it returns synchronously with ReturnValue=0 (no job). The call needs
-        // the VSSD serialized as embedded-instance text, which the backend
-        // does not build yet, so the implementation lands in M11-W2. Until
-        // then report a clear error rather than guessing (design 3.8:
-        // "推測で実装しない"). The operation layer already reports the created
-        // checkpoint's id so the user can clean up (design 3.3).
-        let _ = checkpoint;
-        Err(HyperVError::backend(RawError::new(
-            "checkpoint rename is not implemented yet (M11-W2); the method \
-             (ModifySystemSettings) is confirmed by M11-V V4, and the checkpoint \
-             was created with the provider's default name",
-        )))
+        // M11-V V4: `ModifySystemSettings` renames a checkpoint by taking its
+        // VSSD, serialized as WMI DTD text, with a new `ElementName`. The call
+        // returns synchronously with ReturnValue=0 (no job).
+        let host = host_name();
+        let service = management_service_path(&host);
+        let vssd_path = vssd_object_path(&vssd_instance_id(checkpoint));
+        let con = self.connected()?;
+        let vssd = con.get_object(vssd_path.as_str()).map_err(map_wmi_error)?;
+        vssd.put_property("ElementName", name.to_string())
+            .map_err(map_wmi_error)?;
+        let settings = vssd_to_dtd_text(&vssd)?;
+        let out = exec_method_with(
+            con,
+            &service,
+            "Msvm_VirtualSystemManagementService",
+            "ModifySystemSettings",
+            &[("SystemSettings", Variant::String(settings))],
+        )?;
+        let return_value = return_value(&out)?;
+        if return_value != 0 {
+            return Err(HyperVError::backend(RawError::new(format!(
+                "ModifySystemSettings failed with {return_value}"
+            ))));
+        }
+        Ok(Pending::Done)
     }
 
     fn restore_checkpoint(
@@ -1885,15 +1923,17 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_rename_waits_for_its_implementation() {
-        // M11-V V4 confirmed `ModifySystemSettings` renames a checkpoint; the
-        // call itself is implemented in M11-W2. Until then the backend reports
-        // clearly instead of guessing.
+    fn checkpoint_rename_needs_a_live_connection() {
+        // The rename goes straight to `Msvm_VirtualSystemManagementService`
+        // (M11-V V4); without a connection it reports the remembered failure
+        // rather than a misleading "not implemented" (implemented in M11-W2).
         let mut backend = WmiBackend::connect_or_unavailable();
-        let error = backend
-            .rename_checkpoint(CheckpointId::new(uuid::Uuid::nil()), "wanted")
-            .expect_err("rename waits for the M11-W2 implementation");
-        assert!(error.to_string().contains("not implemented yet"), "{error}");
+        if let State::Unavailable(_) = backend.state {
+            let error = backend
+                .rename_checkpoint(CheckpointId::new(uuid::Uuid::nil()), "wanted")
+                .expect_err("no connection");
+            assert_eq!(error.kind(), "hyper_v_unavailable");
+        }
     }
 
     #[test]
@@ -1933,10 +1973,15 @@ mod tests {
     }
 
     #[test]
-    fn the_vssd_path_uses_the_instance_id() {
+    fn the_vssd_path_uses_only_the_instance_id_key() {
+        // `InstanceID` is the sole key; a redundant `CreationClassName` makes
+        // the path invalid (WBEM_E_INVALID_OBJECT_PATH), so it must not appear.
         let path = vssd_object_path("Microsoft:4D679572-6FAC-464D-8CA4-B960A1AC66CA");
-        assert!(path.contains(r#"CreationClassName="Msvm_VirtualSystemSettingData""#));
-        assert!(path.contains(r#"InstanceID="Microsoft:4D679572-6FAC-464D-8CA4-B960A1AC66CA""#));
+        assert_eq!(
+            path,
+            r#"\\.\root\virtualization\v2:Msvm_VirtualSystemSettingData.InstanceID="Microsoft:4D679572-6FAC-464D-8CA4-B960A1AC66CA""#
+        );
+        assert!(!path.contains("CreationClassName"));
     }
 
     #[test]

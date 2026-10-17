@@ -489,6 +489,51 @@ fn checkpoint_create_list_and_remove_round_trip() {
 
 #[test]
 #[ignore = "requires a Windows host with Hyper-V"]
+fn checkpoint_rename_sets_the_element_name() {
+    let _guard = mutation_lock();
+    let mut backend = must_connect(backend());
+    let id = must_find_test_vm(&mut backend);
+    assert_safe_vm(&mut backend, id);
+
+    // Renaming needs no new disk, so it works even when the VHD store is
+    // compressed and checkpoint creation is refused (0xC03A001A). It still
+    // changes the checkpoint set, so restore the original name afterwards.
+    let before = backend.list_checkpoints(id).expect("list_checkpoints");
+    let Some(existing) = before.first().cloned() else {
+        eprintln!("no checkpoint to rename on the test VM; skipping");
+        return;
+    };
+    let original = existing.name.clone();
+    let wanted = "hypervctl-test-renamed";
+
+    // M11-V V4: ModifySystemSettings renames the checkpoint synchronously.
+    let pending = backend
+        .rename_checkpoint(existing.id, wanted)
+        .expect("rename_checkpoint");
+    assert!(
+        matches!(pending, hypervctl_core::Pending::Done),
+        "rename is synchronous, got {pending:?}"
+    );
+    let renamed = backend.list_checkpoints(id).expect("list_checkpoints");
+    let target = renamed
+        .iter()
+        .find(|checkpoint| checkpoint.id == existing.id)
+        .expect("the renamed checkpoint");
+    assert_eq!(target.name, wanted, "ElementName should be the new name");
+
+    backend
+        .rename_checkpoint(existing.id, &original)
+        .expect("restore the original name");
+    let restored = backend.list_checkpoints(id).expect("list_checkpoints");
+    let target = restored
+        .iter()
+        .find(|checkpoint| checkpoint.id == existing.id)
+        .expect("the restored checkpoint");
+    assert_eq!(target.name, original, "the original name is restored");
+}
+
+#[test]
+#[ignore = "requires a Windows host with Hyper-V"]
 fn job_status_reports_unknown_jobs_as_backend_errors() {
     let mut backend = must_connect(backend());
     use hypervctl_core::JobRef;
