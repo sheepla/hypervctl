@@ -160,12 +160,14 @@ Keys (full list under `?` inside the TUI): `j`/`k` or arrow keys move,
 - MVP scope: VMs (list, detail, power, checkpoints), virtual switches
   (read-only), attached VHDs (read-only). Creating or deleting VMs, NIC/disk
   attachment, live migration, replication and GPU support are not included.
-- Switch type (Public / Private / Internal) is shown as `Unknown(0)` because
-  Hyper-V does not expose it through a single WMI property.
-- NIC IP addresses require guest integration services and are not available
-  through WMI; they are always shown as empty.
-- Integration services of a VM are not listed because the WMI class is not
-  registered on all hosts.
+- Switch type (External / Internal / Private) is shown as `Unknown` because
+  Hyper-V does not expose it through a single WMI property; determining it
+  requires walking the port/uplink associations, which is not implemented yet.
+- NIC IP addresses are not collected: they require guest integration services
+  and are not available through WMI.
+- Integration services are listed only when the host exposes the WMI component
+  classes. When they cannot be read the field is null (JSON) or `-` (table),
+  which is distinct from an empty list.
 - `vm restart` waits for a graceful guest shutdown followed by a start. If
   the guest OS does not respond to the shutdown request (e.g. integration
   services are not running), the command times out; use `vm restart --force`
