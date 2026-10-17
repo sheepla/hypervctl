@@ -165,9 +165,10 @@ Keys (full list under `?` inside the TUI): `j`/`k` or arrow keys move,
   requires walking the port/uplink associations, which is not implemented yet.
 - NIC IP addresses are not collected: they require guest integration services
   and are not available through WMI.
-- Integration services are listed only when the host exposes the WMI component
-  classes. When they cannot be read the field is null (JSON) or `-` (table),
-  which is distinct from an empty list.
+- Integration services are not collected yet on the real backend: the WMI
+  component classes and their host-dependent availability still need
+  verification, so the field is null (JSON) or `-` (table), which is distinct
+  from an empty list.
 - `vm restart` waits for a graceful guest shutdown followed by a start. If
   the guest OS does not respond to the shutdown request (e.g. integration
   services are not running), the command times out; use `vm restart --force`
