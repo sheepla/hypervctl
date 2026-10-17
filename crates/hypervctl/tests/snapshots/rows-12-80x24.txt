@@ -8,7 +8,7 @@
 ┃ > vm-12                           Off              -          -            - ┃
 ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ rows 7-12 of 12 ┛
 ┌vm-12 · Off───────────────────────────────────────────────────────────────────┐
-│ Details   Checkpoints   Monitor   Thumbnail                                  │
+│  [1] Details  [2] Checkpoints  [3] Monitor  [4] Thumbnail                    │
 │ Loading...                                                                   │
 │                                                                              │
 │                                                                              │

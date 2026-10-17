@@ -6,7 +6,7 @@
 ┃   web-02                          Off              -          -            - ┃
 ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
 ┌db-01 · Saved─────────────────────────────────────────────────────────────────┐
-│ Details   Checkpoints   Monitor   Thumbnail                                  │
+│  [1] Details  [2] Checkpoints  [3] Monitor  [4] Thumbnail                    │
 │ No preview (VM is Saved)                                                     │
 │                                                                              │
 │                                                                              │

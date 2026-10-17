@@ -143,13 +143,14 @@ Management service (`vmms`) is stopped, commands fail with
 ## TUI
 
 `hypervctl tui` opens a two-pane dashboard: the VM list on top, the details
-of the selected VM below (Details and Checkpoints tabs). It needs an
+of the selected VM below (Details, Checkpoints, Monitor and Thumbnail tabs).
+It needs an
 interactive terminal of at least 80x24 and is refused on a pipe.
 
 Keys (full list under `?` inside the TUI): `j`/`k` or arrow keys move,
 `Tab` switches focus between the panes, `g`/`G` jump to the first/last VM,
 `Space` opens the action menu, `Enter` runs the selected menu entry,
-`Esc` cancels or goes back, `1`/`2` pick the detail tab, `r` refreshes,
+`Esc` cancels or goes back, `1`-`4` pick the detail tab, `r` refreshes,
 `q` or `Ctrl+C` quits.
 
 ## Limitations

@@ -59,48 +59,30 @@ pub fn render(frame: &mut Frame, area: Rect, state: &State) {
     }
 }
 
-/// `Details   Checkpoints   Monitor`, the selected tab reversed (spec 3.2;
-/// `Monitor` since M12).
+/// ` [1] Details `, ` [2] Checkpoints `, ` [3] Monitor `, ` [4] Thumbnail `,
+/// the selected tab reversed (spec 3.2; `Monitor` since M12). The number is the
+/// key that selects the tab, padded on both sides.
 fn tab_line(state: &State) -> Line<'static> {
     let selected = Style::new().reversed();
     let plain = Style::new();
-    Line::from(vec![
-        Span::styled(
-            "Details",
-            if state.detail.tab == DetailTab::Details {
+    let tabs = [
+        (1, "Details", DetailTab::Details),
+        (2, "Checkpoints", DetailTab::Checkpoints),
+        (3, "Monitor", DetailTab::Monitor),
+        (4, "Thumbnail", DetailTab::Thumbnail),
+    ];
+    let spans: Vec<Span<'static>> = tabs
+        .into_iter()
+        .map(|(key, label, tab)| {
+            let style = if state.detail.tab == tab {
                 selected
             } else {
                 plain
-            },
-        ),
-        Span::raw("   "),
-        Span::styled(
-            "Checkpoints",
-            if state.detail.tab == DetailTab::Checkpoints {
-                selected
-            } else {
-                plain
-            },
-        ),
-        Span::raw("   "),
-        Span::styled(
-            "Monitor",
-            if state.detail.tab == DetailTab::Monitor {
-                selected
-            } else {
-                plain
-            },
-        ),
-        Span::raw("   "),
-        Span::styled(
-            "Thumbnail",
-            if state.detail.tab == DetailTab::Thumbnail {
-                selected
-            } else {
-                plain
-            },
-        ),
-    ])
+            };
+            Span::styled(format!(" [{key}] {label} "), style)
+        })
+        .collect();
+    Line::from(spans)
 }
 
 /// The pane title: `<VM name> · <State>`, or empty when the selection is

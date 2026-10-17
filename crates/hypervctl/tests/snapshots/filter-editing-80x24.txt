@@ -5,7 +5,7 @@
 ┃                                                                              ┃
 ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
 ┌web-01 · Running──────────────────────────────────────────────────────────────┐
-│ Details   Checkpoints   Monitor   Thumbnail                                  │
+│  [1] Details  [2] Checkpoints  [3] Monitor  [4] Thumbnail                    │
 │ Loading...                                                                   │
 │                                                                              │
 │                                                                              │
