@@ -972,6 +972,15 @@ impl HyperV for WmiBackend {
                 }
             }
         }
+        // Checkpoint configurations also own NICs (EPASD), but they are not
+        // connected VMs. Keep only GUIDs that name a real VM.
+        let vm_rows: Vec<VmNameRow> =
+            self.run_query("SELECT Name, ElementName FROM Msvm_ComputerSystem")?;
+        let known_vms: std::collections::HashSet<uuid::Uuid> = vm_rows
+            .iter()
+            .filter_map(|row| row.name.parse::<uuid::Uuid>().ok())
+            .collect();
+        connected_vm_ids.retain(|id| known_vms.contains(id.as_uuid()));
         let summary = SwitchSummary {
             id,
             name: row.element_name,

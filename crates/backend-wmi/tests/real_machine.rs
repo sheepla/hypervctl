@@ -157,6 +157,30 @@ fn list_switches_reads_the_inventory() {
 
 #[test]
 #[ignore = "requires a Windows host with Hyper-V"]
+fn get_switch_reports_only_real_vms_as_connected() {
+    let mut backend = must_connect(backend());
+    let vm_ids: Vec<VmId> = backend
+        .list_vms()
+        .expect("list_vms")
+        .iter()
+        .map(|vm| vm.id)
+        .collect();
+    let switches = backend.list_switches().expect("list_switches");
+    for switch in switches {
+        let detail = backend.get_switch(switch.id).expect("get_switch");
+        // Checkpoint configurations own NICs too, but their GUIDs are not VMs.
+        for vm_id in &detail.connected_vm_ids {
+            assert!(
+                vm_ids.contains(vm_id),
+                "switch {} lists {vm_id}, which is not a VM",
+                detail.summary.name
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a Windows host with Hyper-V"]
 fn list_vhds_reports_attachments_with_controller_slots() {
     let mut backend = must_connect(backend());
     let all = backend.list_vhds(None).expect("list_vhds");
