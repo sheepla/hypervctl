@@ -366,6 +366,33 @@ fn get_vhd_matches_the_attachment_list_entry() {
     );
 }
 
+/// `get_thumbnail` returns the requested size for a VM with a console, and an
+/// Off VM (no console) is refused (M13-V).
+#[test]
+#[ignore = "requires a Windows host with Hyper-V"]
+fn a_running_vm_yields_a_thumbnail_of_the_requested_size() {
+    let mut backend = must_connect(backend());
+    let vms = backend.list_vms().expect("list_vms");
+    // 320x240 was one of the sizes probed on a real host.
+    if let Some(running) = vms.iter().find(|vm| vm.state == VmState::Running) {
+        let thumbnail = backend
+            .get_thumbnail(running.id, 320, 240)
+            .expect("thumbnail");
+        assert_eq!((thumbnail.width, thumbnail.height), (320, 240));
+        assert_eq!(
+            thumbnail.rgba.len(),
+            320 * 240 * 4,
+            "the RGBA buffer must match the requested size"
+        );
+    }
+    if let Some(off) = vms.iter().find(|vm| vm.state == VmState::Off) {
+        assert!(
+            backend.get_thumbnail(off.id, 320, 240).is_err(),
+            "an Off VM has no console and no thumbnail"
+        );
+    }
+}
+
 /// Waits until `id` reaches `goal`, or fails with the last observed state.
 fn wait_for_state(backend: &mut WmiBackend, id: VmId, goal: VmState) {
     for _ in 0..60 {
