@@ -351,14 +351,9 @@ impl WmiBackend {
     }
 
     /// The realized (non-snapshot) VSSD of a VM, if Hyper-V reported one.
-    /// The active configuration is `Microsoft:Hyper-V:System:Realized`
-    /// (snapshots are `Microsoft:Hyper-V:Snapshot:Realized`).
     fn realized_vssd(rows: &[VssdRow]) -> Option<&VssdRow> {
-        rows.iter().find(|row| {
-            row.virtual_system_type
-                .as_deref()
-                .is_some_and(|t| t.starts_with("Microsoft:Hyper-V:System"))
-        })
+        rows.iter()
+            .find(|row| is_active_config(row.virtual_system_type.as_deref()))
     }
 
     /// NICs of a VM: MAC from SESPD, switch name from EPASD. Both share the
@@ -522,6 +517,13 @@ fn vm_object_path(id: VmId) -> String {
 fn checkpoint_id_from_instance(instance_id: &str) -> Option<CheckpointId> {
     let guid = instance_id.strip_prefix("Microsoft:")?;
     guid.parse::<uuid::Uuid>().ok().map(CheckpointId::new)
+}
+
+/// Whether a VSSD is a VM's active configuration
+/// (`Microsoft:Hyper-V:System:Realized`) rather than a checkpoint
+/// (`Microsoft:Hyper-V:Snapshot:Realized`).
+fn is_active_config(virtual_system_type: Option<&str>) -> bool {
+    virtual_system_type.is_some_and(|t| t.starts_with("Microsoft:Hyper-V:System"))
 }
 
 /// `VirtualSystemSubType` ends with `:1` (Gen1) or `:2` (Gen2) (M0 item 6).
@@ -807,11 +809,7 @@ impl HyperV for WmiBackend {
         let mut generations: std::collections::HashMap<uuid::Uuid, u8> =
             std::collections::HashMap::new();
         for row in subtype_rows {
-            let is_active_config = row
-                .virtual_system_type
-                .as_deref()
-                .is_some_and(|t| t.starts_with("Microsoft:Hyper-V:System"));
-            if !is_active_config {
+            if !is_active_config(row.virtual_system_type.as_deref()) {
                 continue;
             }
             let Some(vm_id) = row
@@ -2034,6 +2032,18 @@ mod tests {
             None
         );
         assert_eq!(generation_from_subtype(None), None);
+    }
+
+    #[test]
+    fn active_configs_are_told_apart_from_checkpoints() {
+        // Observed on a real host (M11-C); the old equality check used a
+        // value that Hyper-V never reports.
+        assert!(is_active_config(Some("Microsoft:Hyper-V:System:Realized")));
+        assert!(!is_active_config(Some(
+            "Microsoft:Hyper-V:Snapshot:Realized"
+        )));
+        assert!(!is_active_config(Some("Microsoft:Hyper-V:Realized")));
+        assert!(!is_active_config(None));
     }
 
     #[test]
