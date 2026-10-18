@@ -72,7 +72,7 @@ fn is_safe_vm_name(name: &str) -> bool {
 
 #[test]
 #[ignore = "requires a Windows host with Hyper-V"]
-fn list_vms_reads_every_vm_in_one_bulk_query() {
+fn list_vms_reads_every_vm_without_per_vm_queries() {
     let mut backend = must_connect(backend());
     let vms = backend.list_vms().expect("list_vms");
     assert!(
@@ -83,10 +83,25 @@ fn list_vms_reads_every_vm_in_one_bulk_query() {
         // Every id is the GUID Hyper-V uses as `Name`.
         assert!(!vm.id.to_string().is_empty());
         assert!(!vm.name.is_empty(), "every VM has a display name");
+        // Generation comes from the active VSSD subtype (Gen1/Gen2).
+        assert!(
+            matches!(vm.generation, Some(1) | Some(2)),
+            "{} has no generation: {:?}",
+            vm.name,
+            vm.generation
+        );
         // State is one of the mapped values or Unknown(raw); never panics.
         let _ = vm.state.to_string();
         if vm.state == VmState::Off || vm.state == VmState::Saved {
             assert_eq!(vm.uptime, None, "Off/Saved VMs report no uptime");
+            assert_eq!(vm.cpu_usage_percent, None, "Off/Saved VMs report no CPU");
+        }
+        if vm.state == VmState::Running {
+            assert!(
+                vm.cpu_usage_percent.is_some(),
+                "{} is running but reports no ProcessorLoad",
+                vm.name
+            );
         }
     }
 }
@@ -100,6 +115,17 @@ fn get_vm_returns_the_same_summary_as_the_list() {
     let detail = backend.get_vm(first.id).expect("get_vm");
     assert_eq!(detail.summary.id, first.id);
     assert_eq!(detail.summary.state, first.state);
+    // Generation, the config file and the notes all come from the active
+    // configuration (`Microsoft:Hyper-V:System:Realized`).
+    assert!(
+        matches!(detail.summary.generation, Some(1) | Some(2)),
+        "generation must come from the VSSD subtype: {:?}",
+        detail.summary.generation
+    );
+    assert!(
+        !detail.config_path.is_empty(),
+        "config path must come from the realized VSSD"
+    );
     // Checkpoint count is a u32 that can be zero.
     let _ = detail.checkpoint_count;
 }

@@ -75,6 +75,9 @@ struct SummaryRow {
     /// Hyper-V reports this as a CIM `uint16`; selected in both queries.
     #[serde(rename = "NumberOfProcessors")]
     number_of_processors: Option<u16>,
+    /// Percentage (0–100); absent for VMs that are not running.
+    #[serde(rename = "ProcessorLoad")]
+    processor_load: Option<u16>,
 }
 
 /// A row of `Msvm_ComputerSystem`, used to name the disks `vhd list` returns.
@@ -86,6 +89,18 @@ struct VmNameRow {
     name: String,
     #[serde(rename = "ElementName")]
     element_name: String,
+}
+
+/// A row of `Msvm_VirtualSystemSettingData`, used by `list_vms` to read each
+/// VM's generation without a per-VM query. The snapshot rows are skipped.
+#[derive(Debug, Deserialize)]
+struct VssdGenerationRow {
+    #[serde(rename = "VirtualSystemIdentifier")]
+    virtual_system_identifier: Option<String>,
+    #[serde(rename = "VirtualSystemType")]
+    virtual_system_type: Option<String>,
+    #[serde(rename = "VirtualSystemSubType")]
+    virtual_system_sub_type: Option<String>,
 }
 
 /// A row of `Msvm_VirtualSystemSettingData`.
@@ -296,14 +311,14 @@ impl WmiBackend {
         // One query for every VM (design 3.1: N+1 forbidden). `Snapshots` and
         // `__Path` are left out on purpose (M0 items 1–2).
         self.run_query(
-            "SELECT Name, ElementName, EnabledState, MemoryUsage, UpTime, NumberOfProcessors \
+            "SELECT Name, ElementName, EnabledState, MemoryUsage, UpTime, NumberOfProcessors, ProcessorLoad \
              FROM Msvm_SummaryInformation",
         )
     }
 
     fn summary_row_for(&mut self, id: VmId) -> Result<Option<SummaryRow>, HyperVError> {
         let wql = format!(
-            "SELECT Name, ElementName, EnabledState, MemoryUsage, UpTime, NumberOfProcessors \
+            "SELECT Name, ElementName, EnabledState, MemoryUsage, UpTime, NumberOfProcessors, ProcessorLoad \
              FROM Msvm_SummaryInformation WHERE Name = '{id}'"
         );
         let mut rows = self.run_query::<SummaryRow>(&wql)?;
@@ -336,11 +351,13 @@ impl WmiBackend {
     }
 
     /// The realized (non-snapshot) VSSD of a VM, if Hyper-V reported one.
+    /// The active configuration is `Microsoft:Hyper-V:System:Realized`
+    /// (snapshots are `Microsoft:Hyper-V:Snapshot:Realized`).
     fn realized_vssd(rows: &[VssdRow]) -> Option<&VssdRow> {
         rows.iter().find(|row| {
             row.virtual_system_type
                 .as_deref()
-                .is_some_and(|t| t == "Microsoft:Hyper-V:Realized")
+                .is_some_and(|t| t.starts_with("Microsoft:Hyper-V:System"))
         })
     }
 
@@ -412,9 +429,12 @@ fn parse_vm_id(name: &str) -> Result<VmId, HyperVError> {
 fn summary_from_row(row: SummaryRow) -> Result<VmSummary, HyperVError> {
     let id = parse_vm_id(&row.name)?;
     let state = VmState::from_enabled_state(row.enabled_state);
-    // Off VMs report no CPU usage and no uptime (spec 2.10). CPU usage is not
-    // on SummaryInformation at all, so it stays None for every state.
-    let cpu_usage_percent = None;
+    // Off/Saved VMs report no CPU usage and no uptime (spec 2.10).
+    // `ProcessorLoad` is a percentage and is absent when the VM is not running.
+    let cpu_usage_percent = match state {
+        VmState::Off | VmState::Saved => None,
+        _ => row.processor_load.map(f64::from),
+    };
     let memory_assigned_bytes = row.memory_usage.map(|mb| mb * 1024 * 1024);
     let uptime = match state {
         VmState::Off | VmState::Saved => None,
@@ -774,7 +794,45 @@ fn pending_from_method(out: &IWbemClassWrapper, operation: &str) -> Result<Pendi
 impl HyperV for WmiBackend {
     fn list_vms(&mut self) -> Result<Vec<VmSummary>, HyperVError> {
         let rows = self.summary_rows()?;
-        rows.into_iter().map(summary_from_row).collect()
+        let mut vms: Vec<VmSummary> = rows
+            .into_iter()
+            .map(summary_from_row)
+            .collect::<Result<_, _>>()?;
+        // Generation lives on the active VSSD, not on `Msvm_SummaryInformation`.
+        // One bulk query keeps this constant in the number of VMs (design 3.1).
+        let subtype_rows: Vec<VssdGenerationRow> = self.run_query(
+            "SELECT VirtualSystemIdentifier, VirtualSystemType, VirtualSystemSubType \
+             FROM Msvm_VirtualSystemSettingData",
+        )?;
+        let mut generations: std::collections::HashMap<uuid::Uuid, u8> =
+            std::collections::HashMap::new();
+        for row in subtype_rows {
+            let is_active_config = row
+                .virtual_system_type
+                .as_deref()
+                .is_some_and(|t| t.starts_with("Microsoft:Hyper-V:System"));
+            if !is_active_config {
+                continue;
+            }
+            let Some(vm_id) = row
+                .virtual_system_identifier
+                .as_deref()
+                .and_then(|s| s.parse::<uuid::Uuid>().ok())
+            else {
+                continue;
+            };
+            if let Some(generation) =
+                generation_from_subtype(row.virtual_system_sub_type.as_deref())
+            {
+                generations.insert(vm_id, generation);
+            }
+        }
+        for vm in &mut vms {
+            if let Some(generation) = generations.get(vm.id.as_uuid()) {
+                vm.generation = Some(*generation);
+            }
+        }
+        Ok(vms)
     }
 
     fn get_vm(&mut self, id: VmId) -> Result<VmDetail, HyperVError> {
@@ -1828,6 +1886,7 @@ mod tests {
             memory_usage,
             up_time,
             number_of_processors: None,
+            processor_load: None,
         }
     }
 
@@ -1846,6 +1905,32 @@ mod tests {
         assert_eq!(summary.memory_assigned_bytes, Some(1024 * 1024 * 1024));
         // UpTime is milliseconds.
         assert_eq!(summary.uptime, Some(Duration::from_millis(48_817)));
+        assert_eq!(summary.cpu_usage_percent, None);
+    }
+
+    #[test]
+    fn processor_load_becomes_the_cpu_percentage() {
+        let mut row = summary_row(
+            "24d18f2f-114e-4654-9d3d-cc03106b4c21",
+            "web-01",
+            2,
+            Some(1024),
+            Some(1000),
+        );
+        row.processor_load = Some(37);
+        let summary = summary_from_row(row).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(summary.cpu_usage_percent, Some(37.0));
+
+        // A stale non-null load on an Off VM is still not a measurement.
+        let mut row = summary_row(
+            "24d18f2f-114e-4654-9d3d-cc03106b4c21",
+            "web-02",
+            3,
+            Some(512),
+            None,
+        );
+        row.processor_load = Some(12);
+        let summary = summary_from_row(row).unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(summary.cpu_usage_percent, None);
     }
 
