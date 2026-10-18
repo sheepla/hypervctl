@@ -519,6 +519,14 @@ fn checkpoint_id_from_instance(instance_id: &str) -> Option<CheckpointId> {
     guid.parse::<uuid::Uuid>().ok().map(CheckpointId::new)
 }
 
+/// Extracts the checkpoint id from a `Parent` object path such as
+/// `\\HOST\root\virtualization\v2:Msvm_VirtualSystemSettingData.InstanceID="Microsoft:{guid}"`.
+/// The `Microsoft:` prefix must be stripped before parsing the GUID.
+fn checkpoint_id_from_parent_path(path: &str) -> Option<CheckpointId> {
+    let id = path.split_once("InstanceID=")?.1.trim_matches('"');
+    checkpoint_id_from_instance(id)
+}
+
 /// Whether a VSSD is a VM's active configuration
 /// (`Microsoft:Hyper-V:System:Realized`) rather than a checkpoint
 /// (`Microsoft:Hyper-V:Snapshot:Realized`).
@@ -947,9 +955,7 @@ impl HyperV for WmiBackend {
                     parent_id: row
                         .parent
                         .as_deref()
-                        .and_then(|p| p.split('=').nth(1))
-                        .and_then(|p| p.trim_matches('"').parse::<uuid::Uuid>().ok())
-                        .map(CheckpointId::new),
+                        .and_then(checkpoint_id_from_parent_path),
                 })
             })
             .collect();
@@ -1998,6 +2004,23 @@ mod tests {
         assert_eq!(checkpoint_id_from_instance("Microsoft:not-a-guid"), None);
         assert_eq!(
             checkpoint_id_from_instance("Other:24d18f2f-114e-4654-9d3d-cc03106b4c21"),
+            None
+        );
+    }
+
+    #[test]
+    fn checkpoint_parent_paths_yield_the_parent_id() {
+        // Observed on a real host (M11-C). The old parser kept the
+        // `Microsoft:` prefix and therefore always returned None.
+        let path = r#"\\WIN11\root\virtualization\v2:Msvm_VirtualSystemSettingData.InstanceID="Microsoft:48FA8389-40FE-4F63-A874-19AA49D310F8""#;
+        let expected = CheckpointId::new(
+            uuid::Uuid::parse_str("48fa8389-40fe-4f63-a874-19aa49d310f8")
+                .unwrap_or_else(|_| unreachable!("guid")),
+        );
+        assert_eq!(checkpoint_id_from_parent_path(path), Some(expected));
+        assert_eq!(checkpoint_id_from_parent_path(""), None);
+        assert_eq!(
+            checkpoint_id_from_parent_path("InstanceID=\"not-a-guid\""),
             None
         );
     }
