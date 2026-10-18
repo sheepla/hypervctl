@@ -77,6 +77,17 @@ struct SummaryRow {
     number_of_processors: Option<u16>,
 }
 
+/// A row of `Msvm_ComputerSystem`, used to name the disks `vhd list` returns.
+/// The host also appears here, with a non-GUID `Name`; it is filtered out when
+/// the name is parsed as a VM id.
+#[derive(Debug, Deserialize)]
+struct VmNameRow {
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "ElementName")]
+    element_name: String,
+}
+
 /// A row of `Msvm_VirtualSystemSettingData`.
 #[derive(Debug, Deserialize)]
 struct VssdRow {
@@ -623,6 +634,17 @@ fn parse_sdrd_instance_id(instance_id: &str) -> Option<(uuid::Uuid, u8, u8)> {
     Some((vm_guid, controller_number, lun))
 }
 
+/// Returns the `Microsoft:{vm-guid}\{controller-guid}\` prefix shared by an
+/// SDRD's `InstanceID` and its controller RASD's `InstanceID`. Both GUIDs stay
+/// in the case the provider reported, because `starts_with` is exact.
+fn controller_key_prefix(instance_id: &str) -> Option<String> {
+    let rest = instance_id.strip_prefix("Microsoft:")?;
+    let mut parts = rest.split('\\');
+    let vm_part = parts.next()?;
+    let controller_guid = parts.next()?;
+    Some(format!("Microsoft:{vm_part}\\{controller_guid}\\"))
+}
+
 /// Maps a controller RASD's `ResourceType` to [`ControllerKind`].
 fn controller_kind_from_rasd(resource_type: Option<u16>) -> ControllerKind {
     match resource_type {
@@ -995,15 +1017,9 @@ impl HyperV for WmiBackend {
         let mut controller_keys: Vec<String> = Vec::new();
         for row in &rows {
             if row.host_resource.as_ref().is_some_and(|h| !h.is_empty()) {
-                if let Some(rest) = row.instance_id.strip_prefix("Microsoft:") {
-                    if let Some((vm_guid, _num, _lun)) = parse_sdrd_instance_id(&row.instance_id) {
-                        let _ = vm_guid;
-                        if let Some(controller_guid) = rest.split('\\').nth(1) {
-                            let key = format!("Microsoft:\\{controller_guid}\\");
-                            if !controller_keys.contains(&key) {
-                                controller_keys.push(key);
-                            }
-                        }
+                if let Some(key) = controller_key_prefix(&row.instance_id) {
+                    if !controller_keys.contains(&key) {
+                        controller_keys.push(key);
                     }
                 }
             }
@@ -1018,10 +1034,22 @@ impl HyperV for WmiBackend {
             for crow in &controller_rows {
                 if crow.instance_id.starts_with(key) && crow.instance_id.matches('\\').count() == 2
                 {
-                    // `Microsoft:\{guid}\{number}` has exactly two backslashes.
+                    // `Microsoft:{vm-guid}\{controller-guid}\{number}` has
+                    // exactly two backslashes.
                     controller_map.insert(key.clone(), crow.resource_type);
                     break;
                 }
+            }
+        }
+        // One bulk query for the names the `VM` column of `vhd list` shows
+        // (design 3.8.3: the count is constant, never one per VM).
+        let vm_name_rows: Vec<VmNameRow> =
+            self.run_query("SELECT Name, ElementName FROM Msvm_ComputerSystem")?;
+        let mut vm_names: std::collections::HashMap<uuid::Uuid, String> =
+            std::collections::HashMap::new();
+        for row in vm_name_rows {
+            if let Ok(guid) = row.name.parse::<uuid::Uuid>() {
+                vm_names.insert(guid, row.element_name);
             }
         }
         let mut attached = Vec::new();
@@ -1043,12 +1071,16 @@ impl HyperV for WmiBackend {
                     continue;
                 }
             }
+            // SDRDs also hang off checkpoint configurations, whose first GUID
+            // is the checkpoint's `ConfigurationID`, not a VM. Only the
+            // configurations present in `Msvm_ComputerSystem` are the VM's own
+            // disks (spec 2.5: the disks attached to a VM).
+            let Some(vm_name) = vm_names.get(&vm_guid).cloned() else {
+                continue;
+            };
             // Classify the controller via the RASD map.
-            let kind = row
-                .instance_id
-                .strip_prefix("Microsoft:")
-                .and_then(|rest| rest.split('\\').nth(1))
-                .and_then(|cg| controller_map.get(&format!("Microsoft:\\{cg}\\")))
+            let kind = controller_key_prefix(&row.instance_id)
+                .and_then(|key| controller_map.get(&key))
                 .map_or(ControllerKind::Unknown(0), |rt| {
                     controller_kind_from_rasd(*rt)
                 });
@@ -1056,7 +1088,7 @@ impl HyperV for WmiBackend {
             attached.push(AttachedVhd {
                 attachment: VhdAttachment {
                     vm_id: VmId::new(vm_guid),
-                    vm_name: String::new(),
+                    vm_name,
                     controller: Controller {
                         kind,
                         number: controller_number,
@@ -1722,6 +1754,35 @@ mod tests {
     }
 
     #[test]
+    fn controller_prefix_keeps_the_vm_guid_and_original_case() {
+        // InstanceIDs observed on a real host (M11-C).
+        let sdrd = "Microsoft:24D18F2F-114E-4654-9D3D-CC03106B4C21\\\
+                    83F8638B-8DCA-4152-9EDA-2CA8B33039B4\\0\\0\\L";
+        let rasd = "Microsoft:24D18F2F-114E-4654-9D3D-CC03106B4C21\\\
+                    83F8638B-8DCA-4152-9EDA-2CA8B33039B4\\0";
+        let prefix = controller_key_prefix(sdrd).unwrap_or_else(|| unreachable!("prefix"));
+        assert_eq!(
+            prefix,
+            "Microsoft:24D18F2F-114E-4654-9D3D-CC03106B4C21\\\
+             83F8638B-8DCA-4152-9EDA-2CA8B33039B4\\"
+        );
+        // The key must match the controller RASD, but not a key without the VM
+        // GUID (the bug M11-C found).
+        assert!(rasd.starts_with(&prefix));
+        assert_eq!(rasd.matches('\\').count(), 2);
+        assert!(!rasd.starts_with("Microsoft:\\83F8638B"));
+        assert_eq!(
+            parse_sdrd_instance_id(sdrd),
+            Some((
+                uuid::Uuid::parse_str("24D18F2F-114E-4654-9D3D-CC03106B4C21")
+                    .unwrap_or_else(|_| unreachable!("guid")),
+                0,
+                0
+            ))
+        );
+    }
+
+    #[test]
     #[ignore = "probe: real machine only"]
     fn wmi_round_trips_of_list_vhds_stay_constant_plus_per_disk() {
         let mut backend = WmiBackend::connect_or_unavailable();
@@ -1730,8 +1791,9 @@ mod tests {
         backend.query_count = 0;
         backend.method_count = 0;
         let attached = backend.list_vhds(None).expect("list_vhds");
-        // Two bulk queries: the attachment walk and the controller lookup.
-        assert_eq!(backend.query_count, 2, "list_vhds must not query per VM");
+        // Three bulk queries: the attachment walk, the controller lookup and the
+        // VM names (design 3.8.3: constant, never one per VM or disk).
+        assert_eq!(backend.query_count, 3, "list_vhds must not query per VM");
         // One or two ImageManagementService calls per attached disk (design
         // 3.8.3: the state call is skipped when the setting data failed).
         let disks = attached.len() as u32;

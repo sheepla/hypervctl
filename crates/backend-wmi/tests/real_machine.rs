@@ -14,8 +14,8 @@
 
 use hypervctl_backend_wmi::WmiBackend;
 use hypervctl_core::{
-    HyperV, HyperVError, JobFailReason, RequestedState, TargetKind, VhdFormat, VhdKind, VmId,
-    VmState,
+    ControllerKind, HyperV, HyperVError, JobFailReason, RequestedState, TargetKind, VhdFormat,
+    VhdKind, VmId, VmState,
 };
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
@@ -160,15 +160,27 @@ fn list_switches_reads_the_inventory() {
 fn list_vhds_reports_attachments_with_controller_slots() {
     let mut backend = must_connect(backend());
     let all = backend.list_vhds(None).expect("list_vhds");
+    let listed = backend.list_vms().expect("list_vms");
+    let vm_ids: Vec<VmId> = listed.iter().map(|vm| vm.id).collect();
     for attached in &all {
         let att = &attached.attachment;
-        // Every attachment must have a real VM id (not nil) and a path.
-        assert_ne!(
-            att.vm_id,
-            VmId::new(uuid::Uuid::nil()),
-            "SDRD walk must resolve the owning VM"
+        // Checkpoint configurations also own SDRDs, but their GUID is not a
+        // VM. Every returned attachment must belong to one of the listed VMs.
+        assert!(
+            vm_ids.contains(&att.vm_id),
+            "attachment for {} must belong to a VM",
+            att.vm_id
         );
         assert!(!att.path.as_os_str().is_empty(), "path must not be empty");
+        assert!(
+            !att.vm_name.is_empty(),
+            "the owning VM's name must be filled from Msvm_ComputerSystem"
+        );
+        assert!(
+            !matches!(att.controller.kind, ControllerKind::Unknown(_)),
+            "controller {:?} must be classified (IDE/SCSI/SATA)",
+            att.controller.kind
+        );
         assert!(
             att.controller.number < 4,
             "controller number {} is implausible",
@@ -181,11 +193,11 @@ fn list_vhds_reports_attachments_with_controller_slots() {
         );
     }
     // Filtering by a known VM returns only that VM's disks.
-    let listed = backend.list_vms().expect("list_vms");
     if let Some(first) = listed.first() {
         let filtered = backend.list_vhds(Some(first.id)).expect("filter");
         for attached in &filtered {
             assert_eq!(attached.attachment.vm_id, first.id);
+            assert_eq!(attached.attachment.vm_name, first.name);
         }
     }
 }
